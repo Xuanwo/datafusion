@@ -109,7 +109,11 @@ fn roundtrip_asof_join() -> Result<()> {
 
     for projection in [None, Some(vec![]), Some(vec![0, 5])] {
         for op in [Operator::Lt, Operator::LtEq, Operator::Gt, Operator::GtEq] {
-            for mode in [AsOfJoinMode::Broadcast, AsOfJoinMode::Partitioned] {
+            for mode in [
+                AsOfJoinMode::Broadcast,
+                AsOfJoinMode::Partitioned,
+                AsOfJoinMode::Auto,
+            ] {
                 roundtrip_test(Arc::new(
                     AsOfJoinExec::try_new(
                         Arc::new(EmptyExec::new(Arc::clone(&left_schema))),

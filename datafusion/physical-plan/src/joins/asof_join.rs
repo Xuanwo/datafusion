@@ -29,6 +29,7 @@
 //! [`AsOfJoinMode::Broadcast`] collects the right input once and shares it with
 //! every left partition. [`AsOfJoinMode::Partitioned`] hash repartitions both
 //! inputs by their equality keys and streams the matching partition pair.
+//! [`AsOfJoinMode::Auto`] is resolved by the physical optimizer before execution.
 //!
 //! [`AsOfJoinExec::input_distribution_requirements`] describes the selected
 //! strategy: broadcast requires one right partition, while repartitioned mode
@@ -140,6 +141,8 @@ pub enum AsOfJoinMode {
     Broadcast,
     /// Co-partition both inputs by equality keys and stream each partition pair.
     Partitioned,
+    /// Let the physical optimizer choose between broadcast and partitioned execution.
+    Auto,
 }
 
 impl std::fmt::Display for AsOfJoinMode {
@@ -147,6 +150,7 @@ impl std::fmt::Display for AsOfJoinMode {
         match self {
             Self::Broadcast => write!(f, "Broadcast"),
             Self::Partitioned => write!(f, "Partitioned"),
+            Self::Auto => write!(f, "Auto"),
         }
     }
 }
@@ -289,19 +293,40 @@ impl AsOfJoinExec {
     }
 
     /// Selects the physical distribution strategy.
-    pub fn with_partition_mode(mut self, mode: AsOfJoinMode) -> Result<Self> {
-        if mode == AsOfJoinMode::Partitioned && self.on.is_empty() {
-            return plan_err!(
-                "Partitioned AsOfJoinExec requires at least one equality key"
-            );
+    pub fn with_partition_mode(&self, mode: AsOfJoinMode) -> Result<Self> {
+        if mode != AsOfJoinMode::Broadcast && self.on.is_empty() {
+            return plan_err!("{mode} AsOfJoinExec requires at least one equality key");
         }
-        self.mode = mode;
-        Ok(self)
+        let projection = self.projection.as_deref().map(<[usize]>::to_vec);
+        let mut join = Self::try_new(
+            Arc::clone(&self.left),
+            Arc::clone(&self.right),
+            self.on.clone(),
+            self.match_condition.clone(),
+            projection,
+        )?;
+        join.mode = mode;
+        Ok(join)
     }
 
     /// Returns the selected physical distribution strategy.
     pub fn partition_mode(&self) -> AsOfJoinMode {
         self.mode
+    }
+
+    /// Returns the left input.
+    pub fn left(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.left
+    }
+
+    /// Returns the right input.
+    pub fn right(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.right
+    }
+
+    /// Returns the equality expressions for the left and right inputs.
+    pub fn on(&self) -> &JoinOn {
+        &self.on
     }
 
     fn compute_properties(
@@ -389,7 +414,9 @@ impl DisplayAs for AsOfJoinExec {
             .unwrap_or_default();
         let mode = match self.mode {
             AsOfJoinMode::Broadcast => String::new(),
-            AsOfJoinMode::Partitioned => format!(", mode={}", self.mode),
+            AsOfJoinMode::Partitioned | AsOfJoinMode::Auto => {
+                format!(", mode={}", self.mode)
+            }
         };
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
@@ -404,7 +431,7 @@ impl DisplayAs for AsOfJoinExec {
             DisplayFormatType::TreeRender => {
                 writeln!(f, "on={on}")?;
                 writeln!(f, "match={match_condition}")?;
-                if self.mode == AsOfJoinMode::Partitioned {
+                if self.mode != AsOfJoinMode::Broadcast {
                     writeln!(f, "mode={}", self.mode)?;
                 }
                 Ok(())
@@ -446,6 +473,10 @@ impl ExecutionPlan for AsOfJoinExec {
                     Distribution::KeyPartitioned(right_exprs),
                 ])
             }
+            AsOfJoinMode::Auto => InputDistributionRequirements::new(vec![
+                Distribution::UnspecifiedDistribution,
+                Distribution::UnspecifiedDistribution,
+            ]),
         }
     }
 
@@ -562,6 +593,11 @@ impl ExecutionPlan for AsOfJoinExec {
                 right_partitions,
                 "Partitioned AsOfJoinExec requires equal partition counts, found {left_partitions} and {right_partitions}"
             ),
+            AsOfJoinMode::Auto => {
+                return plan_err!(
+                    "AsOfJoinMode::Auto must be resolved before AsOfJoinExec execution"
+                );
+            }
         }
         let left_stream = self.left.execute(partition, Arc::clone(&context))?;
         let metrics = AsOfJoinMetrics::new(partition, &self.metrics);
@@ -578,6 +614,7 @@ impl ExecutionPlan for AsOfJoinExec {
                 ))
             })?),
             AsOfJoinMode::Partitioned => None,
+            AsOfJoinMode::Auto => unreachable!("Auto mode was rejected above"),
         };
         let right = Arc::clone(&self.right);
         let (left_keys, right_keys) = self.on.iter().cloned().unzip();
@@ -717,6 +754,11 @@ impl ExecutionPlan for AsOfJoinExec {
                 );
             }
         };
+        let partition_mode = match mode {
+            AsOfJoinMode::Broadcast => protobuf::AsOfJoinPartitionMode::Broadcast,
+            AsOfJoinMode::Partitioned => protobuf::AsOfJoinPartitionMode::Partitioned,
+            AsOfJoinMode::Auto => protobuf::AsOfJoinPartitionMode::Auto,
+        };
 
         Ok(Some(protobuf::PhysicalPlanNode {
             physical_plan_type: Some(
@@ -738,7 +780,7 @@ impl ExecutionPlan for AsOfJoinExec {
                                 projection.iter().map(|index| *index as u32).collect()
                             }
                         },
-                        partitioned: *mode == AsOfJoinMode::Partitioned,
+                        partition_mode: partition_mode.into(),
                     },
                 )),
             ),
@@ -770,7 +812,7 @@ impl AsOfJoinExec {
             right_match_expr,
             match_operator,
             projection,
-            partitioned,
+            partition_mode,
         } = &**asof_join;
 
         let left = ctx.decode_required_child(left.as_deref(), "AsOfJoinExec", "left")?;
@@ -832,10 +874,15 @@ impl AsOfJoinExec {
             indices => Some(indices.iter().map(|index| *index as usize).collect()),
         };
 
-        let mode = if *partitioned {
-            AsOfJoinMode::Partitioned
-        } else {
-            AsOfJoinMode::Broadcast
+        let mode = match protobuf::AsOfJoinPartitionMode::try_from(*partition_mode)
+            .map_err(|_| {
+                datafusion_common::internal_datafusion_err!(
+                    "AsOfJoinExec: unknown AsOfJoinPartitionMode {partition_mode}"
+                )
+            })? {
+            protobuf::AsOfJoinPartitionMode::Broadcast => AsOfJoinMode::Broadcast,
+            protobuf::AsOfJoinPartitionMode::Partitioned => AsOfJoinMode::Partitioned,
+            protobuf::AsOfJoinPartitionMode::Auto => AsOfJoinMode::Auto,
         };
         Ok(Arc::new(
             Self::try_new(

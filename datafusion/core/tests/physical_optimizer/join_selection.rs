@@ -39,13 +39,18 @@ use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr
 use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 use datafusion_physical_optimizer::PhysicalOptimizerContext;
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
-use datafusion_physical_optimizer::join_selection::JoinSelection;
+use datafusion_physical_optimizer::join_selection::{
+    AsOfJoinKeyStatistics, JoinSelection,
+};
 use datafusion_physical_plan::displayable;
 use datafusion_physical_plan::joins::utils::ColumnIndex;
 use datafusion_physical_plan::joins::utils::JoinFilter;
-use datafusion_physical_plan::joins::{HashJoinExec, NestedLoopJoinExec, PartitionMode};
+use datafusion_physical_plan::joins::{
+    AsOfJoinExec, AsOfJoinMode, AsOfMatchExpr, HashJoinExec, NestedLoopJoinExec,
+    PartitionMode,
+};
 use datafusion_physical_plan::operator_statistics::{
-    ClosureStatisticsProvider, StatisticsRegistry, StatisticsResult,
+    ClosureStatisticsProvider, ExtendedStatistics, StatisticsRegistry, StatisticsResult,
 };
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
@@ -707,6 +712,160 @@ async fn test_join_swap_uses_context_statistics_registry() -> Result<()> {
     assert_eq!(swapped_join.left().schema().field(0).name(), "right_col");
     assert_eq!(swapped_join.right().schema().field(0).name(), "left_col");
 
+    Ok(())
+}
+
+fn asof_input_statistics(rows: usize, bytes: usize, distinct_keys: usize) -> Statistics {
+    Statistics {
+        num_rows: Precision::Exact(rows),
+        total_byte_size: Precision::Exact(bytes),
+        column_statistics: vec![
+            ColumnStatistics {
+                null_count: Precision::Exact(0),
+                distinct_count: Precision::Exact(distinct_keys),
+                byte_size: Precision::Exact(rows.saturating_mul(8)),
+                ..ColumnStatistics::new_unknown()
+            },
+            ColumnStatistics::new_unknown(),
+        ],
+    }
+}
+
+fn optimize_asof_mode(
+    left_stats: Statistics,
+    right_stats: Statistics,
+    left_max_group_rows: Option<usize>,
+    right_max_group_rows: Option<usize>,
+) -> Result<AsOfJoinMode> {
+    let left_schema = Schema::new(vec![
+        Field::new("left_key", DataType::Int64, false),
+        Field::new("left_ts", DataType::Int64, false),
+    ]);
+    let right_schema = Schema::new(vec![
+        Field::new("right_key", DataType::Int64, false),
+        Field::new("right_ts", DataType::Int64, false),
+    ]);
+    let left: Arc<dyn ExecutionPlan> =
+        Arc::new(StatisticsExec::new(left_stats.clone(), left_schema));
+    let right: Arc<dyn ExecutionPlan> =
+        Arc::new(StatisticsExec::new(right_stats.clone(), right_schema));
+    let join = AsOfJoinExec::try_new(
+        Arc::clone(&left),
+        Arc::clone(&right),
+        vec![(
+            Arc::new(Column::new("left_key", 0)) as _,
+            Arc::new(Column::new("right_key", 0)) as _,
+        )],
+        AsOfMatchExpr::new(
+            Arc::new(Column::new("left_ts", 1)),
+            Operator::GtEq,
+            Arc::new(Column::new("right_ts", 1)),
+        ),
+        None,
+    )?
+    .with_partition_mode(AsOfJoinMode::Auto)?;
+    let mut config = ConfigOptions::new();
+    config.execution.target_partitions = 16;
+    let provider = ClosureStatisticsProvider::with_matches(
+        |plan| {
+            matches!(
+                plan.schema().field(0).name().as_str(),
+                "left_key" | "right_key"
+            )
+        },
+        move |plan, _child_stats| {
+            let (base, max_group_rows) = match plan.schema().field(0).name().as_str() {
+                "left_key" => (left_stats.clone(), left_max_group_rows),
+                "right_key" => (right_stats.clone(), right_max_group_rows),
+                _ => return Ok(StatisticsResult::Delegate),
+            };
+            let mut stats = ExtendedStatistics::new(base);
+            if let Some(max_group_rows) = max_group_rows {
+                stats.set_extension(AsOfJoinKeyStatistics::new(vec![
+                    Precision::Exact(max_group_rows),
+                    Precision::Absent,
+                ]));
+            }
+            Ok(StatisticsResult::Computed(stats))
+        },
+    );
+    struct ContextWithRegistry {
+        config: ConfigOptions,
+        registry: StatisticsRegistry,
+    }
+    impl PhysicalOptimizerContext for ContextWithRegistry {
+        fn config_options(&self) -> &ConfigOptions {
+            &self.config
+        }
+
+        fn statistics_registry(&self) -> Option<&StatisticsRegistry> {
+            Some(&self.registry)
+        }
+    }
+    let context = ContextWithRegistry {
+        config,
+        registry: StatisticsRegistry::with_providers(vec![Arc::new(provider)]),
+    };
+    let optimized =
+        JoinSelection::new().optimize_with_context(Arc::new(join), &context)?;
+    Ok(optimized
+        .downcast_ref::<AsOfJoinExec>()
+        .expect("join selection must preserve AsOfJoinExec")
+        .partition_mode())
+}
+
+#[test]
+fn asof_auto_repartitions_large_high_cardinality_inputs() -> Result<()> {
+    let stats = asof_input_statistics(10_000_000, 240_000_000, 250_000);
+    assert_eq!(
+        optimize_asof_mode(stats.clone(), stats, Some(40), Some(40))?,
+        AsOfJoinMode::Partitioned
+    );
+    Ok(())
+}
+
+#[test]
+fn asof_auto_broadcasts_a_small_right_input() -> Result<()> {
+    assert_eq!(
+        optimize_asof_mode(
+            asof_input_statistics(20_000_000, 480_000_000, 100_000),
+            asof_input_statistics(200_000, 4_800_000, 100_000),
+            Some(200),
+            Some(2),
+        )?,
+        AsOfJoinMode::Broadcast
+    );
+    Ok(())
+}
+
+#[test]
+fn asof_auto_broadcasts_skewed_inputs() -> Result<()> {
+    let stats = asof_input_statistics(10_000_000, 240_000_000, 250_001);
+    assert_eq!(
+        optimize_asof_mode(stats.clone(), stats, Some(9_500_000), Some(9_500_000),)?,
+        AsOfJoinMode::Broadcast
+    );
+    Ok(())
+}
+
+#[test]
+fn asof_auto_broadcasts_without_exact_key_statistics() -> Result<()> {
+    let mut stats = asof_input_statistics(10_000_000, 240_000_000, 250_000);
+    stats.column_statistics[0].distinct_count = Precision::Absent;
+    assert_eq!(
+        optimize_asof_mode(stats.clone(), stats, None, None)?,
+        AsOfJoinMode::Broadcast
+    );
+    Ok(())
+}
+
+#[test]
+fn asof_auto_repartitions_exact_unique_keys_without_extension() -> Result<()> {
+    let stats = asof_input_statistics(10_000_000, 240_000_000, 10_000_000);
+    assert_eq!(
+        optimize_asof_mode(stats.clone(), stats, None, None)?,
+        AsOfJoinMode::Partitioned
+    );
     Ok(())
 }
 

@@ -1859,13 +1859,11 @@ impl DefaultPhysicalPlanner {
                         planning_ctx,
                     )?,
                 );
-                let mode = if session_state
-                    .config_options()
-                    .optimizer
-                    .repartition_asof_joins
+                let mode = if session_state.config().target_partitions() > 1
+                    && session_state.config().repartition_joins()
                     && !join_on.is_empty()
                 {
-                    AsOfJoinMode::Partitioned
+                    AsOfJoinMode::Auto
                 } else {
                     AsOfJoinMode::Broadcast
                 };

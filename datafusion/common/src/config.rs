@@ -1708,11 +1708,6 @@ config_namespace! {
         /// using the provided `target_partitions` level
         pub repartition_joins: bool, default = true
 
-        /// Should DataFusion repartition both sides of an ASOF join by its equality keys.
-        /// This can improve parallelism and reduce memory use for large, well-distributed
-        /// inputs. ASOF joins without equality keys always use broadcast execution.
-        pub repartition_asof_joins: bool, default = false
-
         /// Should DataFusion allow symmetric hash joins for unbounded data sources even when
         /// its inputs do not have any ordering or filtering If the flag is not enabled,
         /// the SymmetricHashJoin operator will be unable to prune its internal buffers,
