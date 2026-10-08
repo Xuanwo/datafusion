@@ -109,28 +109,34 @@ fn roundtrip_asof_join() -> Result<()> {
 
     for projection in [None, Some(vec![]), Some(vec![0, 5])] {
         for op in [Operator::Lt, Operator::LtEq, Operator::Gt, Operator::GtEq] {
-            for mode in [
-                AsOfJoinMode::Broadcast,
-                AsOfJoinMode::Partitioned,
-                AsOfJoinMode::Auto,
-            ] {
-                roundtrip_test(Arc::new(
-                    AsOfJoinExec::try_new(
-                        Arc::new(EmptyExec::new(Arc::clone(&left_schema))),
-                        Arc::new(EmptyExec::new(Arc::clone(&right_schema))),
-                        on.clone(),
-                        AsOfMatchExpr::new(
-                            Arc::new(Column::new("ts", 1)),
-                            op,
-                            Arc::new(Column::new("ts", 1)),
-                        ),
-                        projection.clone(),
-                    )?
-                    .with_partition_mode(mode)?,
-                ))?;
-            }
+            roundtrip_test(Arc::new(AsOfJoinExec::try_new(
+                Arc::new(EmptyExec::new(Arc::clone(&left_schema))),
+                Arc::new(EmptyExec::new(Arc::clone(&right_schema))),
+                on.clone(),
+                AsOfMatchExpr::new(
+                    Arc::new(Column::new("ts", 1)),
+                    op,
+                    Arc::new(Column::new("ts", 1)),
+                ),
+                projection.clone(),
+            )?))?;
         }
     }
+
+    roundtrip_test(Arc::new(
+        AsOfJoinExec::try_new(
+            Arc::new(EmptyExec::new(Arc::clone(&left_schema))),
+            Arc::new(EmptyExec::new(Arc::clone(&right_schema))),
+            on,
+            AsOfMatchExpr::new(
+                Arc::new(Column::new("ts", 1)),
+                Operator::GtEq,
+                Arc::new(Column::new("ts", 1)),
+            ),
+            None,
+        )?
+        .with_partition_mode(AsOfJoinMode::Partitioned)?,
+    ))?;
     Ok(())
 }
 

@@ -1708,6 +1708,12 @@ config_namespace! {
         /// using the provided `target_partitions` level
         pub repartition_joins: bool, default = true
 
+        /// Should DataFusion execute keyed ASOF joins with ordered range partitions.
+        /// This can avoid repeated right-side scans and parallelize skewed equality
+        /// groups by their match key. ASOF joins without equality keys always use
+        /// broadcast execution.
+        pub repartition_asof_joins: bool, default = false
+
         /// Should DataFusion allow symmetric hash joins for unbounded data sources even when
         /// its inputs do not have any ordering or filtering If the flag is not enabled,
         /// the SymmetricHashJoin operator will be unable to prune its internal buffers,

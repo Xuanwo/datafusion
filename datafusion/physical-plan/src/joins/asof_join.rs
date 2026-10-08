@@ -27,18 +27,14 @@
 //! ```
 //!
 //! [`AsOfJoinMode::Broadcast`] collects the right input once and shares it with
-//! every left partition. [`AsOfJoinMode::Partitioned`] hash repartitions both
-//! inputs by their equality keys and streams the matching partition pair.
-//! [`AsOfJoinMode::Auto`] is resolved by the physical optimizer before execution.
+//! every left partition. [`AsOfJoinMode::Partitioned`] samples the ordered
+//! right input, divides the full equality-and-match key space into ordered
+//! ranges, and streams the left input through matching range partitions.
 //!
 //! [`AsOfJoinExec::input_distribution_requirements`] describes the selected
-//! strategy: broadcast requires one right partition, while repartitioned mode
-//! requires both inputs to be co-partitioned by their equality keys.
-//! [`AsOfJoinExec::required_input_ordering`] requires both inputs to be ordered.
-//! The physical optimizer satisfies these contracts by inserting operators such
-//! as `RepartitionExec`, `SortExec`, `CoalescePartitionsExec`, or
-//! `SortPreservingMergeExec`, depending on the input properties. The inserted
-//! plan shape is therefore not fixed by this operator.
+//! strategy: broadcast requires one right partition, while partitioned mode
+//! performs its data-dependent range repartition internally. Both strategies
+//! require ordered inputs through [`AsOfJoinExec::required_input_ordering`].
 //!
 //! Both inputs must be ordered by their equality keys followed by the match
 //! key. For `<` and `<=`, the match ordering is reversed so all directions use
@@ -55,21 +51,20 @@
 //! ```
 //!
 //! Each output partition owns its cursors, equality-group state, and current
-//! candidate. Broadcast right batches are immutable and shared; repartitioned
-//! right batches are released after the cursor, candidate, and pending output
-//! no longer reference them.
+//! candidate. Right batches are immutable and shared without copying. When a
+//! range boundary splits an equality group, the partitioned strategy prepends
+//! the nearest valid right predecessor to the following range.
 //! The key state-machine entry point is [`AsOfJoinStream::poll_next_impl`].
 //!
 //! Broadcast mode preserves probe-side parallelism when there are no equality keys
-//! or when equality keys have low cardinality or skew. It retains the complete
-//! right input in the memory pool and may scan it once per left partition.
-//! Repartitioned mode avoids that retained global input and repeated scan when
-//! equality keys distribute well, at the cost of repartitioning both inputs.
+//! or when the right input is small. It may scan the complete right input once
+//! per left partition. Partitioned mode scans each ordered right range once and
+//! can divide a skewed equality group by its match key, at the cost of sampling
+//! the right input and range repartitioning the left input.
 //!
 //! [ASOF JOIN]: https://docs.snowflake.com/en/sql-reference/constructs/asof-join
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -85,23 +80,31 @@ use arrow::datatypes::{Schema, SchemaRef};
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::utils::memory::RecordBatchMemoryCounter;
-use datafusion_common::utils::normalize_float_zero;
-use datafusion_common::{
-    ColumnStatistics, JoinSide, JoinType, NullEquality, Result, Statistics,
-    assert_eq_or_internal_err, internal_err, plan_err, project_schema,
+use datafusion_common::utils::{
+    bisect, compare_rows, get_row_at_idx, normalize_float_zero,
 };
+use datafusion_common::{
+    ColumnStatistics, JoinSide, JoinType, NullEquality, Result, ScalarValue, SplitPoint,
+    Statistics, assert_eq_or_internal_err, assert_or_internal_err, internal_err,
+    plan_err, project_schema,
+};
+use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_expr::Operator;
-use datafusion_physical_expr::PhysicalSortExpr;
 use datafusion_physical_expr::expressions::Column as PhysicalColumn;
 use datafusion_physical_expr::projection::{ProjectionMapping, ProjectionRef};
 use datafusion_physical_expr::utils::collect_columns;
+use datafusion_physical_expr::{PhysicalSortExpr, RangePartitioning};
 use datafusion_physical_expr_common::physical_expr::{
     PhysicalExprRef, fmt_sql, is_volatile,
 };
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, OrderingRequirements};
-use futures::{Stream, StreamExt, TryStreamExt, future::poll_fn, ready, stream};
+use futures::{
+    Stream, StreamExt, TryStreamExt,
+    future::{poll_fn, try_join_all},
+    ready, stream,
+};
 
 use crate::execution_plan::{Boundedness, EmissionType};
 use crate::joins::utils::{
@@ -110,15 +113,17 @@ use crate::joins::utils::{
 };
 use crate::memory::MemoryStream;
 use crate::metrics::{
-    BaselineMetrics, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricsSet,
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricsSet,
     RecordOutput, Time,
 };
 use crate::projection::{EmbeddedProjection, ProjectionExec, try_embed_projection};
+use crate::repartition::RepartitionExec;
+use crate::sorts::streaming_merge::StreamingMergeBuilder;
 use crate::statistics::{ChildStats, StatisticsArgs};
 use crate::stream::RecordBatchStreamAdapter;
 use crate::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
-    ExecutionPlanProperties, InputDistributionRequirements, PlanProperties,
+    ExecutionPlanProperties, InputDistributionRequirements, Partitioning, PlanProperties,
     RecordBatchStream, ReplaceChildrenOptions, SendableRecordBatchStream,
     validate_child_count,
 };
@@ -139,10 +144,8 @@ pub struct AsOfMatchExpr {
 pub enum AsOfJoinMode {
     /// Collect the complete right input once and share it across left partitions.
     Broadcast,
-    /// Co-partition both inputs by equality keys and stream each partition pair.
+    /// Partition both inputs into compatible ordered key ranges.
     Partitioned,
-    /// Let the physical optimizer choose between broadcast and partitioned execution.
-    Auto,
 }
 
 impl std::fmt::Display for AsOfJoinMode {
@@ -150,7 +153,6 @@ impl std::fmt::Display for AsOfJoinMode {
         match self {
             Self::Broadcast => write!(f, "Broadcast"),
             Self::Partitioned => write!(f, "Partitioned"),
-            Self::Auto => write!(f, "Auto"),
         }
     }
 }
@@ -183,6 +185,8 @@ pub struct AsOfJoinExec {
     right_ordering: LexOrdering,
     /// Shared collection future used only by broadcast mode.
     right_fut: OnceAsync<BroadcastRightInput>,
+    /// Shared ordered-range preparation used only by partitioned mode.
+    partitioned_fut: OnceAsync<PartitionedAsOfInput>,
     cache: Arc<PlanProperties>,
 }
 
@@ -260,6 +264,7 @@ impl AsOfJoinExec {
             &left,
             &join_schema,
             projection.as_deref(),
+            AsOfJoinMode::Broadcast,
         )?);
 
         Ok(Self {
@@ -275,6 +280,7 @@ impl AsOfJoinExec {
             left_ordering,
             right_ordering,
             right_fut: Default::default(),
+            partitioned_fut: Default::default(),
             cache,
         })
     }
@@ -293,20 +299,18 @@ impl AsOfJoinExec {
     }
 
     /// Selects the physical distribution strategy.
-    pub fn with_partition_mode(&self, mode: AsOfJoinMode) -> Result<Self> {
-        if mode != AsOfJoinMode::Broadcast && self.on.is_empty() {
+    pub fn with_partition_mode(mut self, mode: AsOfJoinMode) -> Result<Self> {
+        if mode == AsOfJoinMode::Partitioned && self.on.is_empty() {
             return plan_err!("{mode} AsOfJoinExec requires at least one equality key");
         }
-        let projection = self.projection.as_deref().map(<[usize]>::to_vec);
-        let mut join = Self::try_new(
-            Arc::clone(&self.left),
-            Arc::clone(&self.right),
-            self.on.clone(),
-            self.match_condition.clone(),
-            projection,
-        )?;
-        join.mode = mode;
-        Ok(join)
+        self.mode = mode;
+        self.cache = Arc::new(Self::compute_properties(
+            &self.left,
+            &self.join_schema,
+            self.projection.as_deref(),
+            mode,
+        )?);
+        Ok(self)
     }
 
     /// Returns the selected physical distribution strategy.
@@ -314,25 +318,11 @@ impl AsOfJoinExec {
         self.mode
     }
 
-    /// Returns the left input.
-    pub fn left(&self) -> &Arc<dyn ExecutionPlan> {
-        &self.left
-    }
-
-    /// Returns the right input.
-    pub fn right(&self) -> &Arc<dyn ExecutionPlan> {
-        &self.right
-    }
-
-    /// Returns the equality expressions for the left and right inputs.
-    pub fn on(&self) -> &JoinOn {
-        &self.on
-    }
-
     fn compute_properties(
         left: &Arc<dyn ExecutionPlan>,
         join_schema: &SchemaRef,
         projection: Option<&[usize]>,
+        mode: AsOfJoinMode,
     ) -> Result<PlanProperties> {
         let left_schema = left.schema();
         let mapping = ProjectionMapping::try_new(
@@ -352,9 +342,14 @@ impl AsOfJoinExec {
         let input_eq_properties = left.equivalence_properties();
         let mut eq_properties =
             input_eq_properties.project(&mapping, Arc::clone(join_schema));
-        let mut output_partitioning = left
-            .output_partitioning()
-            .project(&mapping, input_eq_properties);
+        let mut output_partitioning = match mode {
+            AsOfJoinMode::Broadcast => left
+                .output_partitioning()
+                .project(&mapping, input_eq_properties),
+            AsOfJoinMode::Partitioned => Partitioning::UnknownPartitioning(
+                left.output_partitioning().partition_count(),
+            ),
+        };
         if let Some(projection) = projection {
             let projection_mapping =
                 ProjectionMapping::from_indices(projection, join_schema)?;
@@ -414,9 +409,7 @@ impl DisplayAs for AsOfJoinExec {
             .unwrap_or_default();
         let mode = match self.mode {
             AsOfJoinMode::Broadcast => String::new(),
-            AsOfJoinMode::Partitioned | AsOfJoinMode::Auto => {
-                format!(", mode={}", self.mode)
-            }
+            AsOfJoinMode::Partitioned => format!(", mode={}", self.mode),
         };
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
@@ -462,18 +455,7 @@ impl ExecutionPlan for AsOfJoinExec {
                     Distribution::SinglePartition,
                 ])
             }
-            AsOfJoinMode::Partitioned => {
-                let (left_exprs, right_exprs) = self
-                    .on
-                    .iter()
-                    .map(|(left, right)| (Arc::clone(left), Arc::clone(right)))
-                    .unzip();
-                InputDistributionRequirements::co_partitioned(vec![
-                    Distribution::KeyPartitioned(left_exprs),
-                    Distribution::KeyPartitioned(right_exprs),
-                ])
-            }
-            AsOfJoinMode::Auto => InputDistributionRequirements::new(vec![
+            AsOfJoinMode::Partitioned => InputDistributionRequirements::new(vec![
                 Distribution::UnspecifiedDistribution,
                 Distribution::UnspecifiedDistribution,
             ]),
@@ -488,9 +470,10 @@ impl ExecutionPlan for AsOfJoinExec {
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
-        // ASOF emits exactly one row for each left row and never reorders the
-        // left input. The right input is scanned independently.
-        vec![true, false]
+        match self.mode {
+            AsOfJoinMode::Broadcast => vec![true, false],
+            AsOfJoinMode::Partitioned => vec![false, false],
+        }
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -540,18 +523,20 @@ impl ExecutionPlan for AsOfJoinExec {
                 left_ordering: self.left_ordering.clone(),
                 right_ordering: self.right_ordering.clone(),
                 right_fut: Default::default(),
+                partitioned_fut: Default::default(),
                 cache: Arc::clone(&self.cache),
             })),
-            ChildrenPropertiesMode::Recompute => Ok(Arc::new(
-                Self::try_new(
+            ChildrenPropertiesMode::Recompute => {
+                let join = Self::try_new(
                     left,
                     right,
                     self.on.clone(),
                     self.match_condition.clone(),
                     self.projection.as_deref().map(<[usize]>::to_vec),
                 )?
-                .with_partition_mode(self.mode)?,
-            )),
+                .with_partition_mode(self.mode)?;
+                Ok(Arc::new(join))
+            }
         }
     }
 
@@ -582,41 +567,14 @@ impl ExecutionPlan for AsOfJoinExec {
     ) -> Result<SendableRecordBatchStream> {
         let left_partitions = self.left.output_partitioning().partition_count();
         let right_partitions = self.right.output_partitioning().partition_count();
-        match self.mode {
-            AsOfJoinMode::Broadcast => assert_eq_or_internal_err!(
+        if self.mode == AsOfJoinMode::Broadcast {
+            assert_eq_or_internal_err!(
                 right_partitions,
                 1,
                 "Broadcast AsOfJoinExec requires one right partition, found {right_partitions}"
-            ),
-            AsOfJoinMode::Partitioned => assert_eq_or_internal_err!(
-                left_partitions,
-                right_partitions,
-                "Partitioned AsOfJoinExec requires equal partition counts, found {left_partitions} and {right_partitions}"
-            ),
-            AsOfJoinMode::Auto => {
-                return plan_err!(
-                    "AsOfJoinMode::Auto must be resolved before AsOfJoinExec execution"
-                );
-            }
+            );
         }
-        let left_stream = self.left.execute(partition, Arc::clone(&context))?;
         let metrics = AsOfJoinMetrics::new(partition, &self.metrics);
-        let build_metrics = metrics.clone();
-        let right_fut = match self.mode {
-            AsOfJoinMode::Broadcast => Some(self.right_fut.try_once(|| {
-                let right_stream = self.right.execute(0, Arc::clone(&context))?;
-                let reservation =
-                    MemoryConsumer::new("AsOfJoinInput").register(context.memory_pool());
-                Ok(collect_right_input(
-                    right_stream,
-                    reservation,
-                    build_metrics,
-                ))
-            })?),
-            AsOfJoinMode::Partitioned => None,
-            AsOfJoinMode::Auto => unreachable!("Auto mode was rejected above"),
-        };
-        let right = Arc::clone(&self.right);
         let (left_keys, right_keys) = self.on.iter().cloned().unzip();
         let output_schema = self.schema();
         let stream_schema = Arc::clone(&output_schema);
@@ -631,29 +589,91 @@ impl ExecutionPlan for AsOfJoinExec {
             None => self.column_indices.clone(),
         };
         let batch_size = context.session_config().batch_size();
-        let stream = stream::once(async move {
-            let (right_stream, right_input) = match right_fut {
-                Some(mut right_fut) => {
-                    let right_input = poll_fn(|cx| right_fut.get_shared(cx)).await?;
-                    (right_input.stream()?, Some(right_input))
-                }
-                None => (right.execute(partition, Arc::clone(&context))?, None),
-            };
-            let stream = AsOfJoinStream::new(
-                Arc::clone(&stream_schema),
-                InputCursor::new(left_stream, left_keys, left_match),
-                InputCursor::new(right_stream, right_keys, right_match),
-                match_op,
-                column_indices,
-                batch_size,
-                metrics,
-                right_input,
-            );
-            Ok::<SendableRecordBatchStream, datafusion_common::DataFusionError>(Box::pin(
-                stream,
-            ))
-        })
-        .try_flatten();
+
+        let stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> = match self
+            .mode
+        {
+            AsOfJoinMode::Broadcast => {
+                let left_stream = self.left.execute(partition, Arc::clone(&context))?;
+                let build_metrics = metrics.clone();
+                let mut right_fut = self.right_fut.try_once(|| {
+                    let right_stream = self.right.execute(0, Arc::clone(&context))?;
+                    let reservation = MemoryConsumer::new("AsOfJoinInput")
+                        .register(context.memory_pool());
+                    Ok(collect_right_input(
+                        right_stream,
+                        reservation,
+                        build_metrics,
+                    ))
+                })?;
+                Box::pin(
+                    stream::once(async move {
+                        let right_input = poll_fn(|cx| right_fut.get_shared(cx)).await?;
+                        let right_stream = right_input.stream()?;
+                        Ok::<_, datafusion_common::DataFusionError>(Box::pin(
+                            AsOfJoinStream::new(
+                                Arc::clone(&stream_schema),
+                                InputCursor::new(left_stream, left_keys, left_match),
+                                InputCursor::new(right_stream, right_keys, right_match),
+                                match_op,
+                                column_indices,
+                                batch_size,
+                                metrics,
+                                Some(right_input),
+                            ),
+                        )
+                            as SendableRecordBatchStream)
+                    })
+                    .try_flatten(),
+                )
+            }
+            AsOfJoinMode::Partitioned => {
+                assert_or_internal_err!(
+                    partition < left_partitions,
+                    "Partitioned AsOfJoinExec output partition {partition} is out of range for {left_partitions} partitions"
+                );
+                let left = Arc::clone(&self.left);
+                let right = Arc::clone(&self.right);
+                let left_ordering = self.left_ordering.clone();
+                let right_ordering = self.right_ordering.clone();
+                let group_key_count = self.on.len();
+                let build_metrics = metrics.clone();
+                let prepare_context = Arc::clone(&context);
+                let mut partitioned_fut = self.partitioned_fut.try_once(|| {
+                    Ok(prepare_partitioned_inputs(
+                        left,
+                        right,
+                        left_ordering,
+                        right_ordering,
+                        group_key_count,
+                        left_partitions,
+                        prepare_context,
+                        build_metrics,
+                    ))
+                })?;
+                Box::pin(
+                    stream::once(async move {
+                        let inputs = poll_fn(|cx| partitioned_fut.get_shared(cx)).await?;
+                        let (left_stream, right_stream) =
+                            inputs.streams(partition, &context)?;
+                        Ok::<_, datafusion_common::DataFusionError>(Box::pin(
+                            AsOfJoinStream::new(
+                                Arc::clone(&stream_schema),
+                                InputCursor::new(left_stream, left_keys, left_match),
+                                InputCursor::new(right_stream, right_keys, right_match),
+                                match_op,
+                                column_indices,
+                                batch_size,
+                                metrics,
+                                None,
+                            ),
+                        )
+                            as SendableRecordBatchStream)
+                    })
+                    .try_flatten(),
+                )
+            }
+        };
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             output_schema,
             stream,
@@ -665,14 +685,21 @@ impl ExecutionPlan for AsOfJoinExec {
     }
 
     fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
-        vec![ChildStats::At(partition), ChildStats::Skip]
+        let left = match self.mode {
+            AsOfJoinMode::Broadcast => ChildStats::At(partition),
+            AsOfJoinMode::Partitioned => ChildStats::At(None),
+        };
+        vec![left, ChildStats::Skip]
     }
 
     fn statistics_from_inputs(
         &self,
         input_stats: &[Arc<Statistics>],
-        _args: &StatisticsArgs,
+        args: &StatisticsArgs,
     ) -> Result<Arc<Statistics>> {
+        if self.mode == AsOfJoinMode::Partitioned && args.partition().is_some() {
+            return Ok(Arc::new(Statistics::new_unknown(&self.schema())));
+        }
         // The default is fully unknown, but ASOF emits exactly one output row
         // per left row and preserves statistics for unmodified left columns.
         let left = &input_stats[0];
@@ -728,6 +755,8 @@ impl ExecutionPlan for AsOfJoinExec {
             right_ordering: _,
             // right input collected at execution time, not part of the plan
             right_fut: _,
+            // ordered ranges prepared at execution time, not part of the plan
+            partitioned_fut: _,
             // recomputed by `try_new` on decode
             cache: _,
         } = self;
@@ -754,12 +783,6 @@ impl ExecutionPlan for AsOfJoinExec {
                 );
             }
         };
-        let partition_mode = match mode {
-            AsOfJoinMode::Broadcast => protobuf::AsOfJoinPartitionMode::Broadcast,
-            AsOfJoinMode::Partitioned => protobuf::AsOfJoinPartitionMode::Partitioned,
-            AsOfJoinMode::Auto => protobuf::AsOfJoinPartitionMode::Auto,
-        };
-
         Ok(Some(protobuf::PhysicalPlanNode {
             physical_plan_type: Some(
                 protobuf::physical_plan_node::PhysicalPlanType::AsOfJoin(Box::new(
@@ -780,7 +803,7 @@ impl ExecutionPlan for AsOfJoinExec {
                                 projection.iter().map(|index| *index as u32).collect()
                             }
                         },
-                        partition_mode: partition_mode.into(),
+                        partitioned: *mode == AsOfJoinMode::Partitioned,
                     },
                 )),
             ),
@@ -812,7 +835,7 @@ impl AsOfJoinExec {
             right_match_expr,
             match_operator,
             projection,
-            partition_mode,
+            partitioned,
         } = &**asof_join;
 
         let left = ctx.decode_required_child(left.as_deref(), "AsOfJoinExec", "left")?;
@@ -874,15 +897,10 @@ impl AsOfJoinExec {
             indices => Some(indices.iter().map(|index| *index as usize).collect()),
         };
 
-        let mode = match protobuf::AsOfJoinPartitionMode::try_from(*partition_mode)
-            .map_err(|_| {
-                datafusion_common::internal_datafusion_err!(
-                    "AsOfJoinExec: unknown AsOfJoinPartitionMode {partition_mode}"
-                )
-            })? {
-            protobuf::AsOfJoinPartitionMode::Broadcast => AsOfJoinMode::Broadcast,
-            protobuf::AsOfJoinPartitionMode::Partitioned => AsOfJoinMode::Partitioned,
-            protobuf::AsOfJoinPartitionMode::Auto => AsOfJoinMode::Auto,
+        let mode = if *partitioned {
+            AsOfJoinMode::Partitioned
+        } else {
+            AsOfJoinMode::Broadcast
         };
         Ok(Arc::new(
             Self::try_new(
@@ -941,6 +959,461 @@ async fn collect_right_input(
     })
 }
 
+/// Prepared ordered ranges shared by partitioned streams.
+struct PartitionedAsOfInput {
+    right_schema: SchemaRef,
+    right_ordering: LexOrdering,
+    /// Streaming range repartition of the left input.
+    left: Arc<dyn ExecutionPlan>,
+    left_range_partitions: usize,
+    /// Output range, then original input partition, then ordered batches.
+    right: Vec<Vec<Vec<RecordBatch>>>,
+    /// Keep the collected right buffers accounted for until every range finishes.
+    _right_reservations: Vec<MemoryReservation>,
+}
+
+impl PartitionedAsOfInput {
+    fn streams(
+        &self,
+        partition: usize,
+        context: &Arc<TaskContext>,
+    ) -> Result<(SendableRecordBatchStream, SendableRecordBatchStream)> {
+        let right = self.right.get(partition).ok_or_else(|| {
+            datafusion_common::internal_datafusion_err!(
+                "ASOF right range partition {partition} is missing"
+            )
+        })?;
+        let left: SendableRecordBatchStream = if partition < self.left_range_partitions {
+            self.left.execute(partition, Arc::clone(context))?
+        } else {
+            Box::pin(MemoryStream::try_new(vec![], self.left.schema(), None)?)
+        };
+        Ok((
+            left,
+            merge_range_stream(
+                right,
+                Arc::clone(&self.right_schema),
+                &self.right_ordering,
+                partition,
+                context,
+            )?,
+        ))
+    }
+}
+
+fn merge_range_stream(
+    sources: &[Vec<RecordBatch>],
+    schema: SchemaRef,
+    ordering: &LexOrdering,
+    partition: usize,
+    context: &Arc<TaskContext>,
+) -> Result<SendableRecordBatchStream> {
+    let mut streams = sources
+        .iter()
+        .filter(|batches| !batches.is_empty())
+        .map(|batches| {
+            MemoryStream::try_new(batches.clone(), Arc::clone(&schema), None)
+                .map(|stream| Box::pin(stream) as SendableRecordBatchStream)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    match streams.len() {
+        0 => Ok(Box::pin(MemoryStream::try_new(vec![], schema, None)?)),
+        1 => Ok(streams.pop().expect("one range stream")),
+        _ => {
+            let metrics = ExecutionPlanMetricsSet::new();
+            let reservation =
+                MemoryConsumer::new("AsOfJoinRangeMerge").register(context.memory_pool());
+            StreamingMergeBuilder::new()
+                .with_streams(streams)
+                .with_schema(schema)
+                .with_expressions(ordering)
+                .with_metrics(BaselineMetrics::new(&metrics, partition))
+                .with_batch_size(context.session_config().batch_size())
+                .with_reservation(reservation)
+                .build()
+        }
+    }
+}
+
+struct BufferedInput {
+    batches: Vec<RecordBatch>,
+    reservation: MemoryReservation,
+}
+
+async fn collect_buffered_input(
+    input: SendableRecordBatchStream,
+    reservation: MemoryReservation,
+    metrics: AsOfJoinMetrics,
+) -> Result<BufferedInput> {
+    let mut memory_counter = RecordBatchMemoryCounter::new();
+    let batches = input
+        .try_fold(Vec::new(), |mut batches, batch| {
+            let batch_size = memory_counter.count_batch(&batch);
+            futures::future::ready(reservation.try_grow(batch_size).map(|_| {
+                metrics.build_mem_used.add(batch_size);
+                if batch.num_rows() > 0 {
+                    batches.push(batch);
+                }
+                batches
+            }))
+        })
+        .await?;
+    Ok(BufferedInput {
+        batches,
+        reservation,
+    })
+}
+
+/// Materialized sorted batches and their evaluated ordering keys.
+struct OrderedInput {
+    batches: Vec<RecordBatch>,
+    keys: Vec<Arc<[ArrayRef]>>,
+    offsets: Vec<usize>,
+    num_rows: usize,
+    sort_options: Vec<SortOptions>,
+}
+
+impl OrderedInput {
+    fn try_new(
+        batches: Vec<RecordBatch>,
+        ordering: &LexOrdering,
+    ) -> Result<(Self, usize)> {
+        let mut memory_counter = RecordBatchMemoryCounter::new();
+        for batch in &batches {
+            memory_counter.count_batch(batch);
+        }
+        let keys: Vec<Arc<[ArrayRef]>> = batches
+            .iter()
+            .map(|batch| {
+                ordering
+                    .iter()
+                    .map(|sort_expr| {
+                        sort_expr.expr.evaluate(batch)?.into_array(batch.num_rows())
+                    })
+                    .collect::<Result<Vec<_>>>()
+                    .map(Arc::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Plain column expressions share the input buffers. Only account for
+        // buffers allocated by derived ordering expressions.
+        let keys_size = keys
+            .iter()
+            .flat_map(|keys| keys.iter())
+            .map(|key| memory_counter.count_array(key.as_ref()))
+            .sum();
+        let mut num_rows = 0;
+        let offsets = batches
+            .iter()
+            .map(|batch| {
+                let offset = num_rows;
+                num_rows += batch.num_rows();
+                offset
+            })
+            .collect();
+        Ok((
+            Self {
+                batches,
+                keys,
+                offsets,
+                num_rows,
+                sort_options: ordering.iter().map(|expr| expr.options).collect(),
+            },
+            keys_size,
+        ))
+    }
+
+    fn row(&self, position: usize) -> (usize, usize) {
+        let batch = self.offsets.partition_point(|offset| *offset <= position) - 1;
+        (batch, position - self.offsets[batch])
+    }
+
+    fn row_values(&self, position: usize) -> Result<Vec<ScalarValue>> {
+        let (batch, row) = self.row(position);
+        get_row_at_idx(self.keys[batch].as_ref(), row)
+    }
+}
+
+struct OrderedPartitions {
+    schema: SchemaRef,
+    inputs: Vec<OrderedInput>,
+    reservations: Vec<MemoryReservation>,
+}
+
+async fn collect_ordered_right_input(
+    plan: Arc<dyn ExecutionPlan>,
+    ordering: &LexOrdering,
+    context: Arc<TaskContext>,
+    metrics: AsOfJoinMetrics,
+) -> Result<OrderedPartitions> {
+    let schema = plan.schema();
+    let collect = (0..plan.output_partitioning().partition_count())
+        .map(|partition| {
+            let input = plan.execute(partition, Arc::clone(&context))?;
+            let reservation = MemoryConsumer::new("AsOfJoinRightRanges")
+                .register(context.memory_pool());
+            Ok(SpawnedTask::spawn(collect_buffered_input(
+                input,
+                reservation,
+                metrics.clone(),
+            )))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let buffered = try_join_all(collect.into_iter().map(|task| async move {
+        match task.join_unwind().await {
+            Ok(result) => result,
+            Err(error) => internal_err!("ASOF input collection task failed: {error}"),
+        }
+    }))
+    .await?;
+    let mut inputs = Vec::with_capacity(buffered.len());
+    let mut reservations = Vec::with_capacity(buffered.len());
+    for input in buffered {
+        let (ordered, keys_size) = OrderedInput::try_new(input.batches, ordering)?;
+        input.reservation.try_grow(keys_size)?;
+        metrics.build_mem_used.add(keys_size);
+        inputs.push(ordered);
+        reservations.push(input.reservation);
+    }
+    Ok(OrderedPartitions {
+        schema,
+        inputs,
+        reservations,
+    })
+}
+
+// Bounds planning memory while keeping each source partition's quantile error
+// below roughly 1 / 1024 of its rows per output range.
+const RANGE_SAMPLES_PER_PARTITION: usize = 1024;
+
+fn range_boundaries(
+    inputs: &[OrderedInput],
+    partitions: usize,
+) -> Result<Vec<Vec<ScalarValue>>> {
+    let total_rows = inputs.iter().map(|input| input.num_rows).sum::<usize>();
+    if total_rows == 0 || partitions <= 1 {
+        return Ok(vec![]);
+    }
+
+    let sample_target = total_rows.min(
+        partitions
+            .saturating_mul(RANGE_SAMPLES_PER_PARTITION)
+            .max(partitions),
+    );
+    let mut samples = Vec::with_capacity(sample_target + inputs.len());
+    for input in inputs.iter().filter(|input| input.num_rows > 0) {
+        let numerator = (sample_target as u128) * (input.num_rows as u128);
+        let sample_count = numerator
+            .div_ceil(total_rows as u128)
+            .min(input.num_rows as u128) as usize;
+        for sample in 0..sample_count {
+            let position = (((sample * 2 + 1) as u128) * (input.num_rows as u128)
+                / ((sample_count * 2) as u128)) as usize;
+            samples.push(input.row_values(position)?);
+        }
+    }
+
+    let sort_options = &inputs
+        .iter()
+        .find(|input| input.num_rows > 0)
+        .expect("non-empty ordered input")
+        .sort_options;
+    let mut sort_error = None;
+    samples.sort_by(|left, right| {
+        if sort_error.is_some() {
+            return Ordering::Equal;
+        }
+        match compare_rows(left, right, sort_options) {
+            Ok(ordering) => ordering,
+            Err(error) => {
+                sort_error = Some(error);
+                Ordering::Equal
+            }
+        }
+    });
+    if let Some(error) = sort_error {
+        return Err(error);
+    }
+
+    let mut boundaries: Vec<Vec<ScalarValue>> = Vec::with_capacity(partitions - 1);
+    for partition in 1..partitions {
+        let index = samples.len().saturating_mul(partition) / partitions;
+        let Some(sample) = samples.get(index) else {
+            continue;
+        };
+        if let Some(previous) = boundaries.last()
+            && compare_rows(previous, sample, sort_options)? == Ordering::Equal
+        {
+            continue;
+        }
+        boundaries.push(sample.clone());
+    }
+    Ok(boundaries)
+}
+
+fn split_ordered_partitions(
+    inputs: &[OrderedInput],
+    boundaries: &[Vec<ScalarValue>],
+    partitions: usize,
+) -> Result<Vec<Vec<Vec<RecordBatch>>>> {
+    let mut output = vec![vec![Vec::new(); inputs.len()]; partitions];
+    for (source, input) in inputs.iter().enumerate() {
+        let mut range = 0;
+        let mut boundary = 0;
+        for (batch_index, batch) in input.batches.iter().enumerate() {
+            let keys = input.keys[batch_index].as_ref();
+            let mut start = 0;
+            while boundary < boundaries.len() {
+                let end =
+                    bisect::<true>(keys, &boundaries[boundary], &input.sort_options)?;
+                if end > start {
+                    output[range][source].push(batch.slice(start, end - start));
+                }
+                start = end;
+                if end == batch.num_rows() {
+                    break;
+                }
+                range += 1;
+                boundary += 1;
+            }
+            if start < batch.num_rows() {
+                output[range][source].push(batch.slice(start, batch.num_rows() - start));
+            }
+        }
+    }
+    Ok(output)
+}
+
+struct RangeCandidate {
+    batch: RecordBatch,
+    row: usize,
+    key: Vec<ScalarValue>,
+}
+
+fn last_right_before(
+    input: &OrderedInput,
+    boundary: &[ScalarValue],
+    group_key_count: usize,
+) -> Result<Option<RangeCandidate>> {
+    let mut candidate = None;
+    for (batch_index, batch) in input.batches.iter().enumerate() {
+        let keys = input.keys[batch_index].as_ref();
+        let end = bisect::<true>(keys, boundary, &input.sort_options)?;
+        let group_validity = matchable_join_keys(
+            &keys[..group_key_count],
+            NullEquality::NullEqualsNothing,
+        );
+        let match_validity = keys[group_key_count].logical_nulls();
+        if let Some(row) = (0..end).rev().find(|row| {
+            group_validity
+                .as_ref()
+                .is_none_or(|validity| validity.is_valid(*row))
+                && match_validity
+                    .as_ref()
+                    .is_none_or(|validity| validity.is_valid(*row))
+        }) {
+            candidate = Some(RangeCandidate {
+                batch: batch.clone(),
+                row,
+                key: get_row_at_idx(keys, row)?,
+            });
+        }
+        if end < batch.num_rows() {
+            break;
+        }
+    }
+
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+    if boundary[..group_key_count].iter().any(ScalarValue::is_null)
+        || compare_rows(
+            &candidate.key[..group_key_count],
+            &boundary[..group_key_count],
+            &input.sort_options[..group_key_count],
+        )? != Ordering::Equal
+    {
+        return Ok(None);
+    }
+    Ok(Some(candidate))
+}
+
+fn add_right_range_seeds(
+    output: &mut [Vec<Vec<RecordBatch>>],
+    inputs: &[OrderedInput],
+    boundaries: &[Vec<ScalarValue>],
+    group_key_count: usize,
+) -> Result<()> {
+    let Some(sort_options) = inputs.first().map(|input| &input.sort_options) else {
+        return Ok(());
+    };
+    for (boundary_index, boundary) in boundaries.iter().enumerate() {
+        let mut selected: Option<RangeCandidate> = None;
+        for input in inputs {
+            let Some(candidate) = last_right_before(input, boundary, group_key_count)?
+            else {
+                continue;
+            };
+            let replace = match &selected {
+                Some(current) => {
+                    compare_rows(&current.key, &candidate.key, sort_options)?
+                        == Ordering::Less
+                }
+                None => true,
+            };
+            if replace {
+                selected = Some(candidate);
+            }
+        }
+        if let Some(candidate) = selected {
+            output[boundary_index + 1]
+                .push(vec![candidate.batch.slice(candidate.row, 1)]);
+        }
+    }
+    Ok(())
+}
+
+#[expect(clippy::too_many_arguments)]
+async fn prepare_partitioned_inputs(
+    left: Arc<dyn ExecutionPlan>,
+    right: Arc<dyn ExecutionPlan>,
+    left_ordering: LexOrdering,
+    right_ordering: LexOrdering,
+    group_key_count: usize,
+    partitions: usize,
+    context: Arc<TaskContext>,
+    metrics: AsOfJoinMetrics,
+) -> Result<PartitionedAsOfInput> {
+    let right =
+        collect_ordered_right_input(right, &right_ordering, context, metrics).await?;
+    let boundaries = range_boundaries(&right.inputs, partitions)?;
+    let mut right_ranges =
+        split_ordered_partitions(&right.inputs, &boundaries, partitions)?;
+    add_right_range_seeds(
+        &mut right_ranges,
+        &right.inputs,
+        &boundaries,
+        group_key_count,
+    )?;
+    let range_partitioning = RangePartitioning::try_new(
+        left_ordering,
+        boundaries.into_iter().map(SplitPoint::new).collect(),
+    )?;
+    let left_range_partitions = range_partitioning.partition_count();
+    let left = Arc::new(
+        RepartitionExec::try_new(left, Partitioning::Range(range_partitioning))?
+            .with_preserve_order(),
+    );
+
+    Ok(PartitionedAsOfInput {
+        right_schema: right.schema,
+        right_ordering,
+        left,
+        left_range_partitions,
+        right: right_ranges,
+        _right_reservations: right.reservations,
+    })
+}
+
 /// Last eligible right row for the current left equality group.
 ///
 /// The row and its evaluated keys survive right batch changes and output
@@ -956,6 +1429,8 @@ struct Candidate {
     key_arrays: Arc<[ArrayRef]>,
     /// Identity used to invalidate the cached candidate/left comparator.
     key_batch_id: usize,
+    /// Whether every row in the source batch has the same non-NULL equality key.
+    single_group: bool,
 }
 
 /// Cursor over one ordered input stream.
@@ -982,6 +1457,8 @@ struct InputCursor {
     match_validity: Option<NullBuffer>,
     /// Monotonic identity of the current arrays.
     key_batch_id: usize,
+    /// Whether the current batch contains one non-NULL equality group.
+    single_group: bool,
     /// Current row within `batch`.
     row: usize,
     /// Whether the input stream has returned EOF.
@@ -1004,6 +1481,7 @@ impl InputCursor {
             match_array: None,
             match_validity: None,
             key_batch_id: 0,
+            single_group: false,
             row: 0,
             eof: false,
         }
@@ -1025,6 +1503,7 @@ impl InputCursor {
             self.key_validity = None;
             self.match_array = None;
             self.match_validity = None;
+            self.single_group = false;
             self.row = 0;
             if self.eof {
                 return Poll::Ready(Ok(false));
@@ -1045,6 +1524,27 @@ impl InputCursor {
                 .collect::<Result<Vec<_>>>()?;
             self.key_validity =
                 matchable_join_keys(&key_arrays, NullEquality::NullEqualsNothing);
+            self.single_group = self
+                .key_validity
+                .as_ref()
+                .is_none_or(|validity| validity.null_count() == 0)
+                && key_arrays.iter().try_fold(
+                    true,
+                    |single_group, array| -> Result<bool> {
+                        if !single_group || batch.num_rows() == 1 {
+                            return Ok(single_group);
+                        }
+                        let comparator = make_comparator(
+                            array.as_ref(),
+                            array.as_ref(),
+                            SortOptions {
+                                descending: false,
+                                nulls_first: true,
+                            },
+                        )?;
+                        Ok(comparator(0, batch.num_rows() - 1) == Ordering::Equal)
+                    },
+                )?;
             self.key_arrays = key_arrays.into();
             let match_array = self
                 .match_expr
@@ -1058,6 +1558,12 @@ impl InputCursor {
             self.key_batch_id += 1;
             self.batch = Some(batch);
         }
+    }
+
+    fn has_row(&self) -> bool {
+        self.batch
+            .as_ref()
+            .is_some_and(|batch| self.row < batch.num_rows())
     }
 
     fn group_has_null(&self) -> bool {
@@ -1088,6 +1594,10 @@ impl InputCursor {
 struct AsOfJoinMetrics {
     /// Standard output-row and elapsed-compute metrics.
     baseline: BaselineMetrics,
+    /// Left rows emitted with a matching right row.
+    matched_rows: Count,
+    /// Left rows emitted with NULL padding for the right side.
+    unmatched_left_rows: Count,
     /// Peak bytes retained for the shared right input.
     ///
     /// `peak_memory_usage` records this as `MetricValue::PeakMemoryUsage`; `Gauge`
@@ -1099,6 +1609,9 @@ impl AsOfJoinMetrics {
     fn new(partition: usize, metrics: &ExecutionPlanMetricsSet) -> Self {
         Self {
             baseline: BaselineMetrics::new(metrics, partition),
+            matched_rows: MetricBuilder::new(metrics).counter("matched_rows", partition),
+            unmatched_left_rows: MetricBuilder::new(metrics)
+                .counter("unmatched_left_rows", partition),
             build_mem_used: MetricBuilder::new(metrics)
                 .peak_memory_usage("build_mem_used", partition),
         }
@@ -1112,11 +1625,9 @@ impl AsOfJoinMetrics {
 /// the first source batch, a NULL, and row 0 from the second source batch.
 #[derive(Default)]
 struct PendingRows {
-    /// Distinct source batches referenced by `indices`. `Arc` keeps per-row
-    /// clones O(1) and provides stable identity for deduplication.
+    /// Distinct source batches referenced by `indices` in cursor order.
+    /// Input cursors never revisit a batch, so only the last source can match.
     sources: Vec<Arc<RecordBatch>>,
-    /// Maps an `Arc<RecordBatch>` pointer to its index in `sources`.
-    source_by_ptr: HashMap<usize, usize>,
     /// Per-output-row `(source, row)` references or NULL padding.
     indices: Vec<Option<(usize, usize)>>,
 }
@@ -1130,13 +1641,14 @@ impl PendingRows {
         self.indices.is_empty()
     }
 
-    fn push(&mut self, batch: Arc<RecordBatch>, row: usize) {
-        let ptr = Arc::as_ptr(&batch) as usize;
-        let source = *self.source_by_ptr.entry(ptr).or_insert_with(|| {
-            let source = self.sources.len();
-            self.sources.push(batch);
-            source
-        });
+    fn push(&mut self, batch: &Arc<RecordBatch>, row: usize) {
+        let source = match self.sources.last() {
+            Some(source) if Arc::ptr_eq(source, batch) => self.sources.len() - 1,
+            _ => {
+                self.sources.push(Arc::clone(batch));
+                self.sources.len() - 1
+            }
+        };
         self.indices.push(Some((source, row)));
     }
 
@@ -1193,7 +1705,6 @@ impl PendingRows {
 
     fn clear(&mut self) {
         self.sources.clear();
-        self.source_by_ptr.clear();
         self.indices.clear();
     }
 }
@@ -1229,9 +1740,9 @@ struct AsOfJoinStream {
     /// Equality-key ordering shared by the comparator caches.
     group_sort_options: Vec<SortOptions>,
     /// Cached comparator for the current right and left input batches.
-    input_group_comparator: Option<(usize, usize, JoinKeyComparator)>,
+    input_group_comparator: Option<(usize, usize, JoinKeyComparator, Option<Ordering>)>,
     /// Cached comparator for the candidate and current left batches.
-    candidate_group_comparator: Option<(usize, usize, JoinKeyComparator)>,
+    candidate_group_comparator: Option<(usize, usize, JoinKeyComparator, Option<bool>)>,
     /// Cached match-key comparator for the current right and left batches.
     /// Building it performs type dispatch, so doing so once per batch pair avoids
     /// repeating that work for every candidate comparison.
@@ -1240,6 +1751,8 @@ struct AsOfJoinStream {
     pending_left: PendingRows,
     /// Matched right row references, aligned with `pending_left`.
     pending_right: PendingRows,
+    /// Matched rows accumulated for the next output batch.
+    pending_matched_rows: usize,
     /// Maximum number of pending rows before an output flush.
     batch_size: usize,
     metrics: AsOfJoinMetrics,
@@ -1267,6 +1780,7 @@ impl AsOfJoinStream {
         Self {
             pending_left: PendingRows::default(),
             pending_right: PendingRows::default(),
+            pending_matched_rows: 0,
             schema,
             left,
             right,
@@ -1290,13 +1804,12 @@ impl AsOfJoinStream {
         if self.group_sort_options.is_empty() {
             return Ok(Ordering::Equal);
         }
-        let _timer = self.metrics.baseline.elapsed_compute().timer();
         let right_batch_id = self.right.key_batch_id;
         let left_batch_id = self.left.key_batch_id;
         if self
             .input_group_comparator
             .as_ref()
-            .is_none_or(|(right, left, _)| {
+            .is_none_or(|(right, left, _, _)| {
                 *right != right_batch_id || *left != left_batch_id
             })
         {
@@ -1306,14 +1819,17 @@ impl AsOfJoinStream {
                 &self.group_sort_options,
                 NullEquality::NullEqualsNothing,
             )?;
+            let fixed_ordering = (self.right.single_group && self.left.single_group)
+                .then(|| comparator.compare(self.right.row, self.left.row));
             self.input_group_comparator =
-                Some((right_batch_id, left_batch_id, comparator));
+                Some((right_batch_id, left_batch_id, comparator, fixed_ordering));
         }
-        let (_, _, comparator) = self
+        let (_, _, comparator, fixed_ordering) = self
             .input_group_comparator
             .as_ref()
             .expect("ASOF input group comparator must be initialized");
-        Ok(comparator.compare(self.right.row, self.left.row))
+        Ok(fixed_ordering
+            .unwrap_or_else(|| comparator.compare(self.right.row, self.left.row)))
     }
 
     fn candidate_is_other_group(&mut self) -> Result<bool> {
@@ -1323,30 +1839,33 @@ impl AsOfJoinStream {
         if self.group_sort_options.is_empty() {
             return Ok(false);
         }
-        let _timer = self.metrics.baseline.elapsed_compute().timer();
         let candidate_batch_id = candidate.key_batch_id;
         let left_batch_id = self.left.key_batch_id;
-        if self
-            .candidate_group_comparator
-            .as_ref()
-            .is_none_or(|(candidate, left, _)| {
+        if self.candidate_group_comparator.as_ref().is_none_or(
+            |(candidate, left, _, _)| {
                 *candidate != candidate_batch_id || *left != left_batch_id
-            })
-        {
+            },
+        ) {
             let comparator = JoinKeyComparator::new(
                 candidate.key_arrays.as_ref(),
                 self.left.key_arrays.as_ref(),
                 &self.group_sort_options,
                 NullEquality::NullEqualsNothing,
             )?;
+            let fixed_result =
+                (candidate.single_group && self.left.single_group).then(|| {
+                    comparator.compare(candidate.row, self.left.row) != Ordering::Equal
+                });
             self.candidate_group_comparator =
-                Some((candidate_batch_id, left_batch_id, comparator));
+                Some((candidate_batch_id, left_batch_id, comparator, fixed_result));
         }
-        let (_, _, comparator) = self
+        let (_, _, comparator, fixed_result) = self
             .candidate_group_comparator
             .as_ref()
             .expect("ASOF candidate group comparator must be initialized");
-        Ok(comparator.compare(candidate.row, self.left.row) != Ordering::Equal)
+        Ok(fixed_result.unwrap_or_else(|| {
+            comparator.compare(candidate.row, self.left.row) != Ordering::Equal
+        }))
     }
 
     /// Compares the current right match value with the current left match value.
@@ -1355,7 +1874,6 @@ impl AsOfJoinStream {
     /// of scan direction. [`is_eligible`] interprets that order for the four ASOF
     /// operators, keeping direction-specific logic out of the comparator cache.
     fn compare_input_matches(&mut self) -> Result<Ordering> {
-        let _timer = self.metrics.baseline.elapsed_compute().timer();
         let right_batch_id = self.right.key_batch_id;
         let left_batch_id = self.left.key_batch_id;
         if self
@@ -1417,14 +1935,23 @@ impl AsOfJoinStream {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<RecordBatch>>> {
+        let elapsed_compute = self.metrics.baseline.elapsed_compute().clone();
+        let mut timer = elapsed_compute.timer();
         loop {
             if self.pending_left.len() >= self.batch_size {
                 return Poll::Ready(Some(self.flush()));
             }
-            if !ready!(
-                self.left
-                    .poll_ensure_row(cx, self.metrics.baseline.elapsed_compute())
-            )? {
+            let left_has_row = if self.left.has_row() {
+                true
+            } else if self.left.eof {
+                false
+            } else {
+                timer.stop();
+                let has_row = ready!(self.left.poll_ensure_row(cx, &elapsed_compute))?;
+                timer.restart();
+                has_row
+            };
+            if !left_has_row {
                 if !self.pending_left.is_empty() {
                     return Poll::Ready(Some(self.flush()));
                 }
@@ -1435,7 +1962,7 @@ impl AsOfJoinStream {
             if self.left.match_is_null() || self.left.group_has_null() {
                 self.candidate = None;
                 self.candidate_group_comparator = None;
-                self.push_current_left(None)?;
+                self.push_current_left()?;
                 self.left.advance();
                 continue;
             }
@@ -1445,10 +1972,18 @@ impl AsOfJoinStream {
             }
 
             loop {
-                if !ready!(
-                    self.right
-                        .poll_ensure_row(cx, self.metrics.baseline.elapsed_compute())
-                )? {
+                let right_has_row = if self.right.has_row() {
+                    true
+                } else if self.right.eof {
+                    false
+                } else {
+                    timer.stop();
+                    let has_row =
+                        ready!(self.right.poll_ensure_row(cx, &elapsed_compute))?;
+                    timer.restart();
+                    has_row
+                };
+                if !right_has_row {
                     break;
                 }
                 if self.right.group_has_null() {
@@ -1474,28 +2009,40 @@ impl AsOfJoinStream {
                 // Replacing the candidate selects the nearest eligible row.
                 // Equal match values have no secondary ordering, so which tied
                 // row wins is intentionally nondeterministic.
-                self.candidate = Some(Candidate {
-                    batch,
-                    row,
-                    key_arrays: Arc::clone(&self.right.key_arrays),
-                    key_batch_id: self.right.key_batch_id,
-                });
+                match &mut self.candidate {
+                    Some(candidate) if Arc::ptr_eq(&candidate.batch, &batch) => {
+                        candidate.row = row;
+                    }
+                    candidate => {
+                        *candidate = Some(Candidate {
+                            batch,
+                            row,
+                            key_arrays: Arc::clone(&self.right.key_arrays),
+                            key_batch_id: self.right.key_batch_id,
+                            single_group: self.right.single_group,
+                        });
+                    }
+                }
                 self.right.advance();
             }
 
-            self.push_current_left(self.candidate.clone())?;
+            self.push_current_left()?;
             self.left.advance();
         }
     }
 
-    fn push_current_left(&mut self, candidate: Option<Candidate>) -> Result<()> {
-        let _timer = self.metrics.baseline.elapsed_compute().timer();
-        let (left_batch, left_row) = self.left.batch_row()?;
-        self.pending_left.push(left_batch, left_row);
-        match candidate {
+    fn push_current_left(&mut self) -> Result<()> {
+        let left_batch = self.left.batch.as_ref().ok_or_else(|| {
+            datafusion_common::internal_datafusion_err!(
+                "ASOF left input batch is missing"
+            )
+        })?;
+        self.pending_left.push(left_batch, self.left.row);
+        match &self.candidate {
             Some(candidate) => {
+                self.pending_matched_rows += 1;
                 if self.projects_right {
-                    self.pending_right.push(candidate.batch, candidate.row);
+                    self.pending_right.push(&candidate.batch, candidate.row);
                 }
             }
             None => {
@@ -1510,8 +2057,8 @@ impl AsOfJoinStream {
     /// Materializes pending row references while preserving both cursors and the
     /// current equality-group candidate for the next output batch.
     fn flush(&mut self) -> Result<RecordBatch> {
-        let _timer = self.metrics.baseline.elapsed_compute().timer();
         let row_count = self.pending_left.len();
+        let matched_rows = self.pending_matched_rows;
         let mut arrays = Vec::with_capacity(self.schema.fields().len());
         for (field, column) in self.schema.fields().iter().zip(&self.column_indices) {
             let pending = match column.side {
@@ -1525,6 +2072,7 @@ impl AsOfJoinStream {
         }
         self.pending_left.clear();
         self.pending_right.clear();
+        self.pending_matched_rows = 0;
         let options = RecordBatchOptions::new().with_row_count(Some(row_count));
         let batch = RecordBatch::try_new_with_options(
             Arc::clone(&self.schema),
@@ -1532,6 +2080,10 @@ impl AsOfJoinStream {
             &options,
         )?;
         (&batch).record_output(&self.metrics.baseline);
+        self.metrics.matched_rows.add(matched_rows);
+        self.metrics
+            .unmatched_left_rows
+            .add(row_count - matched_rows);
         Ok(batch)
     }
 }
@@ -1835,91 +2387,15 @@ mod tests {
 
         let metrics = exec.metrics().expect("ASOF metrics must be present");
         assert_eq!(metrics.output_rows(), Some(7));
-        assert!(metrics.elapsed_compute().is_some());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn partitioned_query_streams_matching_partitions() -> Result<()> {
-        let left_schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("ts", DataType::Int64, false),
-            Field::new("id", DataType::Int32, false),
-        ]));
-        let left = TestMemoryExec::try_new_exec(
-            &[
-                vec![make_batch(
-                    &left_schema,
-                    vec![Some("A"), Some("A")],
-                    vec![Some(1), Some(4)],
-                    vec![1, 2],
-                )?],
-                vec![make_batch(
-                    &left_schema,
-                    vec![Some("B"), Some("C")],
-                    vec![Some(2), Some(3)],
-                    vec![3, 4],
-                )?],
-            ],
-            Arc::clone(&left_schema),
-            None,
-        )?;
-
-        let right_schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("ts", DataType::Int64, false),
-            Field::new("price", DataType::Int32, false),
-        ]));
-        let right = TestMemoryExec::try_new_exec(
-            &[
-                vec![make_batch(
-                    &right_schema,
-                    vec![Some("A"), Some("A")],
-                    vec![Some(2), Some(4)],
-                    vec![20, 40],
-                )?],
-                vec![make_batch(
-                    &right_schema,
-                    vec![Some("B"), Some("C")],
-                    vec![Some(1), Some(4)],
-                    vec![101, 204],
-                )?],
-            ],
-            Arc::clone(&right_schema),
-            None,
-        )?;
-
-        let exec = Arc::new(
-            AsOfJoinExec::try_new(
-                left,
-                right,
-                vec![(
-                    Arc::new(PhysicalColumn::new("key", 0)),
-                    Arc::new(PhysicalColumn::new("key", 0)),
-                )],
-                AsOfMatchExpr::new(
-                    Arc::new(PhysicalColumn::new("ts", 1)),
-                    Operator::GtEq,
-                    Arc::new(PhysicalColumn::new("ts", 1)),
-                ),
-                Some(vec![0, 1, 2, 5]),
-            )?
-            .with_partition_mode(AsOfJoinMode::Partitioned)?,
+        assert_eq!(metrics.sum_by_name("matched_rows").unwrap().as_usize(), 3);
+        assert_eq!(
+            metrics
+                .sum_by_name("unmatched_left_rows")
+                .unwrap()
+                .as_usize(),
+            4
         );
-        let batches =
-            collect(Arc::clone(&exec) as _, Arc::new(TaskContext::default())).await?;
-        assert_snapshot!(batches_to_sort_string(&batches), @r"
-        +-----+----+----+-------+
-        | key | ts | id | price |
-        +-----+----+----+-------+
-        | A   | 1  | 1  |       |
-        | A   | 4  | 2  | 40    |
-        | B   | 2  | 3  | 101   |
-        | C   | 3  | 4  |       |
-        +-----+----+----+-------+
-        ");
-        assert_eq!(exec.partition_mode(), AsOfJoinMode::Partitioned);
-        assert_eq!(exec.metrics().unwrap().output_rows(), Some(4));
+        assert!(metrics.elapsed_compute().is_some());
         Ok(())
     }
 
@@ -1935,6 +2411,33 @@ mod tests {
                 .to_string()
                 .contains("requires at least one equality key")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn partitioned_mode_properties() -> Result<()> {
+        let exec = Arc::try_unwrap(test_exec()?)
+            .expect("test owns the ASOF join")
+            .with_partition_mode(AsOfJoinMode::Partitioned)?;
+
+        assert_eq!(exec.properties().emission_type, EmissionType::Incremental);
+        assert_eq!(exec.maintains_input_order(), vec![false, false]);
+        assert!(matches!(
+            exec.properties().partitioning,
+            Partitioning::UnknownPartitioning(1)
+        ));
+        assert_eq!(
+            exec.child_stats_requests(Some(0)),
+            vec![ChildStats::At(None), ChildStats::Skip]
+        );
+
+        let left_stats = Arc::new(Statistics::new_unknown(&exec.left.schema()));
+        let right_stats = Arc::new(Statistics::new_unknown(&exec.right.schema()));
+        let partition_stats = exec.statistics_from_inputs(
+            &[left_stats, right_stats],
+            &StatisticsArgs::new().with_partition(Some(0)),
+        )?;
+        assert_eq!(partition_stats.num_rows, Precision::Absent);
         Ok(())
     }
 

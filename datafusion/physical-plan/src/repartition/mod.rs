@@ -54,7 +54,7 @@ use datafusion_common::ScalarValue;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNodeRecursion;
-use datafusion_common::utils::transpose;
+use datafusion_common::utils::{bisect, transpose};
 use datafusion_common::{
     ColumnStatistics, DataFusionError, HashMap, SplitPoint, assert_or_internal_err,
     internal_datafusion_err, internal_err,
@@ -572,11 +572,15 @@ impl RepartitionExecState {
                 .iter()
                 .map(|e| e.expr.data_type(input.schema().as_ref()))
                 .collect::<Result<Vec<_>>>()?;
-            Some(Arc::new(RangeRouter::try_new_with_data_types(
+            let router = Arc::new(RangeRouter::try_new_with_data_types(
                 &sort_options,
                 range_partitioning.split_points(),
                 &data_types,
-            )?))
+            )?);
+            let input_sorted = input
+                .equivalence_properties()
+                .ordering_satisfy(range_partitioning.ordering().clone())?;
+            Some((router, input_sorted))
         } else {
             None
         };
@@ -662,6 +666,8 @@ enum BatchPartitionerState {
         router: Arc<RangeRouter>,
         /// Row indices grouped by output partition
         indices: Vec<Vec<u32>>,
+        /// Whether each input batch is ordered by the range key.
+        input_sorted: bool,
     },
 }
 
@@ -1091,6 +1097,7 @@ impl BatchPartitioner {
             router,
             num_partitions,
             timer,
+            false,
         ))
     }
 
@@ -1122,7 +1129,13 @@ impl BatchPartitioner {
                 .expect("valid range partitioning"),
         );
 
-        Self::new_range_partitioner_with_router(ordering, router, num_partitions, timer)
+        Self::new_range_partitioner_with_router(
+            ordering,
+            router,
+            num_partitions,
+            timer,
+            false,
+        )
     }
 
     /// Create a new [`BatchPartitioner`] for range-based repartitioning using a pre-constructed [`RangeRouter`].
@@ -1137,12 +1150,14 @@ impl BatchPartitioner {
         router: Arc<RangeRouter>,
         num_partitions: usize,
         timer: metrics::Time,
+        input_sorted: bool,
     ) -> Self {
         Self {
             state: BatchPartitionerState::Range {
                 ordering,
                 router,
                 indices: vec![vec![]; num_partitions],
+                input_sorted,
             },
             timer,
         }
@@ -1277,6 +1292,7 @@ impl BatchPartitioner {
                     ordering,
                     router,
                     indices,
+                    input_sorted,
                 } => {
                     // Tracking time required for distributing indexes across output partitions
                     let timer = self.timer.timer();
@@ -1288,20 +1304,52 @@ impl BatchPartitioner {
                             ordering.iter().map(|e| &e.expr),
                             &batch,
                         )?;
+                        if *input_sorted {
+                            let mut start = 0;
+                            let mut partitioned_batches =
+                                Vec::with_capacity(router.num_split_points() + 1);
+                            for (partition, split_point) in
+                                router.split_points().iter().enumerate()
+                            {
+                                let end = bisect::<true>(
+                                    &arrays,
+                                    split_point.values(),
+                                    router.sort_options(),
+                                )?;
+                                if end > start {
+                                    partitioned_batches.push(Ok((
+                                        partition,
+                                        batch.slice(start, end - start),
+                                    )));
+                                }
+                                start = end;
+                            }
+                            if start < batch.num_rows() {
+                                partitioned_batches.push(Ok((
+                                    router.num_split_points(),
+                                    batch.slice(start, batch.num_rows() - start),
+                                )));
+                            }
+                            timer.done();
+                            Box::new(partitioned_batches.into_iter())
+                        } else {
+                            for v in indices.iter_mut() {
+                                v.clear();
+                            }
 
-                        for v in indices.iter_mut() {
-                            v.clear();
+                            router.route_indices(&arrays, indices)?;
+
+                            // Finished building index-arrays for output partitions
+                            timer.done();
+
+                            let partitioned_batches = Self::partition_grouped_take(
+                                &batch,
+                                indices,
+                                &self.timer,
+                            )?;
+
+                            Box::new(partitioned_batches.into_iter())
                         }
-
-                        router.route_indices(&arrays, indices)?;
-
-                        // Finished building index-arrays for output partitions
-                        timer.done();
-
-                        let partitioned_batches =
-                            Self::partition_grouped_take(&batch, indices, &self.timer)?;
-
-                        Box::new(partitioned_batches.into_iter())
                     }
                 }
             };
@@ -2273,13 +2321,13 @@ impl RepartitionExec {
         mut stream: SendableRecordBatchStream,
         mut output_channels: HashMap<usize, OutputChannel>,
         partitioning: Partitioning,
-        range_router: Option<Arc<RangeRouter>>,
+        range_router: Option<(Arc<RangeRouter>, bool)>,
         metrics: RepartitionMetrics,
         input_partition: usize,
         num_input_partitions: usize,
     ) -> Result<()> {
         let mut partitioner = match (partitioning, range_router) {
-            (Partitioning::Range(range_partitioning), Some(router)) => {
+            (Partitioning::Range(range_partitioning), Some((router, input_sorted))) => {
                 let ordering = range_partitioning.ordering().clone();
                 let num_partitions = range_partitioning.partition_count();
                 BatchPartitioner::new_range_partitioner_with_router(
@@ -2287,6 +2335,7 @@ impl RepartitionExec {
                     router,
                     num_partitions,
                     metrics.repartition_time.clone(),
+                    input_sorted,
                 )
             }
             (partitioning, _) => BatchPartitioner::try_new(
@@ -3225,6 +3274,47 @@ mod tests {
             collect_partition_u32_values(&output_partitions[2])
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn sorted_range_partitioner_slices_at_boundaries() -> Result<()> {
+        let schema = test_schema(false);
+        let partitioning =
+            u32_range_partitioning(&schema, SortOptions::default(), vec![10, 20])?;
+        let Partitioning::Range(range) = partitioning else {
+            unreachable!("test constructs range partitioning")
+        };
+        let sort_options = range
+            .ordering()
+            .iter()
+            .map(|expr| expr.options)
+            .collect::<Vec<_>>();
+        let router = Arc::new(RangeRouter::try_new_with_data_types(
+            &sort_options,
+            range.split_points(),
+            &[DataType::UInt32],
+        )?);
+        let mut partitioner = BatchPartitioner::new_range_partitioner_with_router(
+            range.ordering().clone(),
+            router,
+            range.partition_count(),
+            metrics::Time::default(),
+            true,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UInt32Array::from(vec![5, 10, 10, 15, 20, 25]))],
+        )?;
+        let mut output = vec![Vec::new(); 3];
+        partitioner.partition(batch, |partition, batch| {
+            output[partition].extend(collect_partition_u32_values(&[batch]));
+            Ok(())
+        })?;
+
+        assert_eq!(output[0], vec![Some(5)]);
+        assert_eq!(output[1], vec![Some(10), Some(10), Some(15)]);
+        assert_eq!(output[2], vec![Some(20), Some(25)]);
         Ok(())
     }
 

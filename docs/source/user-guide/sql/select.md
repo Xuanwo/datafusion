@@ -435,15 +435,17 @@ input keys remain addressable.
 
 Without equality keys, all rows belong to one group.
 
-ASOF execution can collect one ordered right partition and share it across every
-left partition, or hash repartition both inputs by their equality keys. When
-`datafusion.optimizer.repartition_joins` is enabled, the physical optimizer uses
-exact input-size and maximum key-group statistics to select repartitioned
-execution only for large, sufficiently distributed inputs. A
-`StatisticsRegistry` provider can supply exact maximum key-group bounds through
-`AsOfJoinKeyStatistics`; an exact unique, non-null equality key needs no
-extension. Small inputs, skewed keys, missing statistics, and joins without
-equality keys use broadcast execution. Join-side spilling is not supported.
+By default, ASOF execution collects one ordered right partition and shares it
+across every left partition, so output partitioning follows the left input. The
+complete right input must fit in memory and may be scanned once per left
+partition. When equality keys are present,
+`datafusion.optimizer.repartition_asof_joins` can instead divide the ordered
+equality-and-match key space into ranges. Each output partition scans one right
+range, while the left input is range repartitioned in parallel. A range boundary
+may split an equality group; DataFusion carries the nearest valid right
+predecessor into the next range so matching remains correct. This avoids
+repeated full right-side scans and can parallelize a skewed equality group, but
+adds sampling and repartitioning overhead. Join-side spilling is not supported.
 
 A `NULL` in either ordered expression or in any equality key does not match.
 Both inputs must be bounded. If multiple right rows have the same equality keys

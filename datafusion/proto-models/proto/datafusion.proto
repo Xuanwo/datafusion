@@ -1809,14 +1809,8 @@ message AsOfJoinExecNode {
   PhysicalExprNode right_match_expr = 5;
   AsOfMatchOperator match_operator = 6;
   repeated uint32 projection = 7;
-  AsOfJoinPartitionMode partition_mode = 8;
-}
-
-enum AsOfJoinPartitionMode {
-  // Keep broadcast as the wire default for plans written before this field existed.
-  AS_OF_JOIN_PARTITION_MODE_BROADCAST = 0;
-  AS_OF_JOIN_PARTITION_MODE_PARTITIONED = 1;
-  AS_OF_JOIN_PARTITION_MODE_AUTO = 2;
+  // Partition both inputs into compatible ordered key ranges instead of broadcasting the right input.
+  bool partitioned = 8;
 }
 
 message AsyncFuncExecNode {

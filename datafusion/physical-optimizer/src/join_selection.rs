@@ -20,27 +20,25 @@
 //! is any) to obtain more performant plans. To achieve the first goal, it
 //! tries to transform a non-runnable query (with the given infinite sources)
 //! into a runnable query by replacing pipeline-breaking join operations with
-//! pipeline-friendly ones. To achieve the second goal, it uses available
-//! statistics to select physical strategies for hash and ASOF joins.
+//! pipeline-friendly ones. To achieve the second goal, it selects the proper
+//! `PartitionMode` and the build side using the available statistics for hash joins.
 
 use crate::PhysicalOptimizerRule;
 use crate::optimizer::{ConfigOnlyContext, PhysicalOptimizerContext};
 use datafusion_common::Statistics;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
-use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{JoinSide, JoinType, internal_err};
 use datafusion_expr_common::sort_properties::SortProperties;
+use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::{LexOrdering, PhysicalExprRef};
 use datafusion_physical_plan::execution_plan::EmissionType;
 use datafusion_physical_plan::joins::utils::ColumnIndex;
 use datafusion_physical_plan::joins::{
-    AsOfJoinExec, AsOfJoinMode, CrossJoinExec, HashJoinExec, NestedLoopJoinExec,
-    PartitionMode, StreamJoinPartitionMode, SymmetricHashJoinExec,
+    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
+    StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
-use datafusion_physical_plan::operator_statistics::ExtendedStatistics;
 use datafusion_physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use std::sync::Arc;
@@ -58,31 +56,6 @@ impl JoinSelection {
     }
 }
 
-/// Exact upper bounds on the number of rows sharing a value in each column.
-///
-/// Statistics providers can attach this type to an input's
-/// [`ExtendedStatistics`]. ASOF join selection uses it to avoid hash
-/// repartitioning inputs with a heavy equality-key value. Each entry corresponds
-/// to the column at the same schema index and includes null values.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AsOfJoinKeyStatistics {
-    max_value_counts: Vec<Precision<usize>>,
-}
-
-impl AsOfJoinKeyStatistics {
-    /// Creates per-column maximum value counts.
-    pub fn new(max_value_counts: Vec<Precision<usize>>) -> Self {
-        Self { max_value_counts }
-    }
-
-    fn max_value_count(&self, index: usize) -> Option<usize> {
-        match self.max_value_counts.get(index) {
-            Some(Precision::Exact(count)) => Some(*count),
-            _ => None,
-        }
-    }
-}
-
 /// Get statistics for a plan node, consulting the registry's providers if one
 /// is available.
 fn get_stats(
@@ -94,17 +67,6 @@ fn get_stats(
         None => StatisticsContext::new(),
     };
     ctx.compute(plan, &StatisticsArgs::new())
-}
-
-fn get_extended_stats(
-    plan: &dyn ExecutionPlan,
-    context: &dyn PhysicalOptimizerContext,
-) -> Result<Arc<ExtendedStatistics>> {
-    let ctx = match context.statistics_registry() {
-        Some(reg) => StatisticsContext::new_with_registry(reg.clone()),
-        None => StatisticsContext::new(),
-    };
-    ctx.compute_extended(plan, &StatisticsArgs::new())
 }
 
 // TODO: We need some performance test for Right Semi/Right Join swap to Left Semi/Left Join in case that the right side is smaller but not much smaller.
@@ -173,105 +135,6 @@ fn supports_collect_by_thresholds(
     } else {
         false
     }
-}
-
-// Require enough work in every target partition to amortize the hash exchange
-// and the additional per-partition sorts. Keep these thresholds internal until
-// broader benchmark coverage justifies a user-facing tuning contract.
-const ASOF_REPARTITION_MIN_BYTES_PER_PARTITION: usize = 4 * 1024 * 1024;
-const ASOF_REPARTITION_MIN_ROWS_PER_PARTITION: usize = 128 * 1024;
-
-/// Returns true when exact statistics show that an input is large enough to
-/// amortize an ASOF hash repartition.
-fn is_large_asof_input(
-    stats: &Statistics,
-    threshold_byte_size: usize,
-    threshold_num_rows: usize,
-) -> bool {
-    match stats.total_byte_size {
-        Precision::Exact(byte_size) => byte_size >= threshold_byte_size,
-        _ => matches!(
-            stats.num_rows,
-            Precision::Exact(num_rows) if num_rows >= threshold_num_rows
-        ),
-    }
-}
-
-/// Returns true when statistics prove that no equality group can exceed one
-/// execution batch. Unknown or expression-derived key statistics deliberately
-/// select broadcast.
-fn has_repartitionable_asof_keys(
-    stats: &ExtendedStatistics,
-    mut keys: impl Iterator<Item = PhysicalExprRef>,
-    batch_size: usize,
-) -> bool {
-    let max_value_counts = stats.get_extension::<AsOfJoinKeyStatistics>();
-    keys.any(|expr| {
-        let Some(column) = expr.downcast_ref::<Column>() else {
-            return false;
-        };
-        if max_value_counts
-            .and_then(|stats| stats.max_value_count(column.index()))
-            .is_some_and(|count| count <= batch_size)
-        {
-            return true;
-        }
-
-        // Standard column statistics can prove the same bound for a unique,
-        // non-null key without an extension.
-        let base = stats.base();
-        let Precision::Exact(num_rows) = base.num_rows else {
-            return false;
-        };
-        base.column_statistics
-            .get(column.index())
-            .is_some_and(|column_stats| {
-                column_stats.null_count == Precision::Exact(0)
-                    && column_stats.distinct_count == Precision::Exact(num_rows)
-            })
-    })
-}
-
-fn should_repartition_asof(
-    asof_join: &AsOfJoinExec,
-    context: &dyn PhysicalOptimizerContext,
-) -> Result<bool> {
-    let config = context.config_options();
-    let target_partitions = config.execution.target_partitions;
-    if !config.optimizer.repartition_joins || target_partitions <= 1 {
-        return Ok(false);
-    }
-
-    let left_stats = get_extended_stats(asof_join.left().as_ref(), context)?;
-    let right_stats = get_extended_stats(asof_join.right().as_ref(), context)?;
-    let threshold_byte_size =
-        ASOF_REPARTITION_MIN_BYTES_PER_PARTITION.saturating_mul(target_partitions);
-    let threshold_num_rows =
-        ASOF_REPARTITION_MIN_ROWS_PER_PARTITION.saturating_mul(target_partitions);
-    if !is_large_asof_input(left_stats.base(), threshold_byte_size, threshold_num_rows)
-        || !is_large_asof_input(
-            right_stats.base(),
-            threshold_byte_size,
-            threshold_num_rows,
-        )
-    {
-        return Ok(false);
-    }
-
-    let (left_keys, right_keys): (Vec<_>, Vec<_>) = asof_join
-        .on()
-        .iter()
-        .map(|(left, right)| (Arc::clone(left), Arc::clone(right)))
-        .unzip();
-    let batch_size = config.execution.batch_size.get();
-    Ok(
-        has_repartitionable_asof_keys(&left_stats, left_keys.into_iter(), batch_size)
-            && has_repartitionable_asof_keys(
-                &right_stats,
-                right_keys.into_iter(),
-                batch_size,
-            ),
-    )
 }
 
 impl PhysicalOptimizerRule for JoinSelection {
@@ -482,17 +345,6 @@ fn statistical_join_selection_subrule(
             && should_swap_join_order(&**left, &**right, context)?
         {
             nl_join.swap_inputs().map(Some)?
-        } else {
-            None
-        }
-    } else if let Some(asof_join) = plan.downcast_ref::<AsOfJoinExec>() {
-        if asof_join.partition_mode() == AsOfJoinMode::Auto {
-            let mode = if should_repartition_asof(asof_join, context)? {
-                AsOfJoinMode::Partitioned
-            } else {
-                AsOfJoinMode::Broadcast
-            };
-            Some(Arc::new(asof_join.with_partition_mode(mode)?) as _)
         } else {
             None
         }

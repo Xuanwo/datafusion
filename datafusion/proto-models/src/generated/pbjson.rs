@@ -1696,7 +1696,7 @@ impl serde::Serialize for AsOfJoinExecNode {
         if !self.projection.is_empty() {
             len += 1;
         }
-        if self.partition_mode != 0 {
+        if self.partitioned {
             len += 1;
         }
         let mut struct_ser = serializer.serialize_struct("datafusion.AsOfJoinExecNode", len)?;
@@ -1723,10 +1723,8 @@ impl serde::Serialize for AsOfJoinExecNode {
         if !self.projection.is_empty() {
             struct_ser.serialize_field("projection", &self.projection)?;
         }
-        if self.partition_mode != 0 {
-            let v = AsOfJoinPartitionMode::try_from(self.partition_mode)
-                .map_err(|_| serde::ser::Error::custom(format!("Invalid variant {}", self.partition_mode)))?;
-            struct_ser.serialize_field("partitionMode", &v)?;
+        if self.partitioned {
+            struct_ser.serialize_field("partitioned", &self.partitioned)?;
         }
         struct_ser.end()
     }
@@ -1748,8 +1746,7 @@ impl<'de> serde::Deserialize<'de> for AsOfJoinExecNode {
             "match_operator",
             "matchOperator",
             "projection",
-            "partition_mode",
-            "partitionMode",
+            "partitioned",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -1761,7 +1758,7 @@ impl<'de> serde::Deserialize<'de> for AsOfJoinExecNode {
             RightMatchExpr,
             MatchOperator,
             Projection,
-            PartitionMode,
+            Partitioned,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -1790,7 +1787,7 @@ impl<'de> serde::Deserialize<'de> for AsOfJoinExecNode {
                             "rightMatchExpr" | "right_match_expr" => Ok(GeneratedField::RightMatchExpr),
                             "matchOperator" | "match_operator" => Ok(GeneratedField::MatchOperator),
                             "projection" => Ok(GeneratedField::Projection),
-                            "partitionMode" | "partition_mode" => Ok(GeneratedField::PartitionMode),
+                            "partitioned" => Ok(GeneratedField::Partitioned),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -1817,7 +1814,7 @@ impl<'de> serde::Deserialize<'de> for AsOfJoinExecNode {
                 let mut right_match_expr__ = None;
                 let mut match_operator__ = None;
                 let mut projection__ = None;
-                let mut partition_mode__ = None;
+                let mut partitioned__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Left => {
@@ -1865,11 +1862,11 @@ impl<'de> serde::Deserialize<'de> for AsOfJoinExecNode {
                                     .into_iter().map(|x| x.0).collect())
                             ;
                         }
-                        GeneratedField::PartitionMode => {
-                            if partition_mode__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("partitionMode"));
+                        GeneratedField::Partitioned => {
+                            if partitioned__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("partitioned"));
                             }
-                            partition_mode__ = Some(map_.next_value::<AsOfJoinPartitionMode>()? as i32);
+                            partitioned__ = Some(map_.next_value()?);
                         }
                     }
                 }
@@ -1881,7 +1878,7 @@ impl<'de> serde::Deserialize<'de> for AsOfJoinExecNode {
                     right_match_expr: right_match_expr__,
                     match_operator: match_operator__.unwrap_or_default(),
                     projection: projection__.unwrap_or_default(),
-                    partition_mode: partition_mode__.unwrap_or_default(),
+                    partitioned: partitioned__.unwrap_or_default(),
                 })
             }
         }
@@ -2106,80 +2103,6 @@ impl<'de> serde::Deserialize<'de> for AsOfJoinNode {
             }
         }
         deserializer.deserialize_struct("datafusion.AsOfJoinNode", FIELDS, GeneratedVisitor)
-    }
-}
-impl serde::Serialize for AsOfJoinPartitionMode {
-    #[allow(deprecated)]
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let variant = match self {
-            Self::Broadcast => "AS_OF_JOIN_PARTITION_MODE_BROADCAST",
-            Self::Partitioned => "AS_OF_JOIN_PARTITION_MODE_PARTITIONED",
-            Self::Auto => "AS_OF_JOIN_PARTITION_MODE_AUTO",
-        };
-        serializer.serialize_str(variant)
-    }
-}
-impl<'de> serde::Deserialize<'de> for AsOfJoinPartitionMode {
-    #[allow(deprecated)]
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        const FIELDS: &[&str] = &[
-            "AS_OF_JOIN_PARTITION_MODE_BROADCAST",
-            "AS_OF_JOIN_PARTITION_MODE_PARTITIONED",
-            "AS_OF_JOIN_PARTITION_MODE_AUTO",
-        ];
-
-        struct GeneratedVisitor;
-
-        impl serde::de::Visitor<'_> for GeneratedVisitor {
-            type Value = AsOfJoinPartitionMode;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(formatter, "expected one of: {:?}", &FIELDS)
-            }
-
-            fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                i32::try_from(v)
-                    .ok()
-                    .and_then(|x| x.try_into().ok())
-                    .ok_or_else(|| {
-                        serde::de::Error::invalid_value(serde::de::Unexpected::Signed(v), &self)
-                    })
-            }
-
-            fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                i32::try_from(v)
-                    .ok()
-                    .and_then(|x| x.try_into().ok())
-                    .ok_or_else(|| {
-                        serde::de::Error::invalid_value(serde::de::Unexpected::Unsigned(v), &self)
-                    })
-            }
-
-            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                match value {
-                    "AS_OF_JOIN_PARTITION_MODE_BROADCAST" => Ok(AsOfJoinPartitionMode::Broadcast),
-                    "AS_OF_JOIN_PARTITION_MODE_PARTITIONED" => Ok(AsOfJoinPartitionMode::Partitioned),
-                    "AS_OF_JOIN_PARTITION_MODE_AUTO" => Ok(AsOfJoinPartitionMode::Auto),
-                    _ => Err(serde::de::Error::unknown_variant(value, FIELDS)),
-                }
-            }
-        }
-        deserializer.deserialize_any(GeneratedVisitor)
     }
 }
 impl serde::Serialize for AsOfMatchOperator {
