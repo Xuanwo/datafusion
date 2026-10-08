@@ -1809,6 +1809,8 @@ message AsOfJoinExecNode {
   PhysicalExprNode right_match_expr = 5;
   AsOfMatchOperator match_operator = 6;
   repeated uint32 projection = 7;
+  // Co-partition both inputs by the equality keys instead of broadcasting the right input.
+  bool partitioned = 8;
 }
 
 message AsyncFuncExecNode {

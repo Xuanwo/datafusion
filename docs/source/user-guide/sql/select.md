@@ -433,11 +433,16 @@ a `USING` clause, divides rows into equality groups before the ordered match.
 An unqualified `USING` key appears once in wildcard output, while both qualified
 input keys remain addressable.
 
-Without equality keys, all rows belong to one group. The initial execution
-strategy collects one ordered right partition and shares it across every left
-partition, so output partitioning follows the left input. The complete right
-input must fit in memory and may be scanned once per left partition; spilling
-and repartitioned ASOF execution are not yet supported.
+Without equality keys, all rows belong to one group.
+
+By default, ASOF execution collects one ordered right partition and shares it
+across every left partition, so output partitioning follows the left input. The
+complete right input must fit in memory and may be scanned once per left
+partition. When equality keys are present,
+`datafusion.optimizer.repartition_asof_joins` can instead hash repartition both
+inputs by those keys and process corresponding partitions in parallel. This
+avoids retaining the complete right input, but adds repartitioning and may
+perform poorly for skewed keys. Join-side spilling is not supported.
 
 A `NULL` in either ordered expression or in any equality key does not match.
 Both inputs must be bounded. If multiple right rows have the same equality keys

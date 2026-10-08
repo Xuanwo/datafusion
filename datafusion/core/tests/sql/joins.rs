@@ -19,8 +19,8 @@ use insta::assert_snapshot;
 
 use datafusion::catalog::MemTable;
 use datafusion::datasource::stream::{FileStreamProvider, StreamConfig, StreamTable};
-use datafusion::physical_plan::joins::AsOfJoinExec;
-use datafusion::physical_plan::{Distribution, ExecutionPlanProperties};
+use datafusion::physical_plan::joins::{AsOfJoinExec, AsOfJoinMode};
+use datafusion::physical_plan::{Distribution, ExecutionPlanProperties, Partitioning};
 use datafusion::test_util::register_unbounded_file_with_ordering;
 use datafusion::{assert_batches_eq, assert_batches_sorted_eq};
 use datafusion_sql::unparser::plan_to_sql;
@@ -523,7 +523,8 @@ async fn asof_join_all_match_directions_across_batches() -> Result<()> {
 
 #[tokio::test]
 async fn asof_join_broadcasts_multi_partition_right_input() -> Result<()> {
-    let config = SessionConfig::new().with_target_partitions(4);
+    let mut config = SessionConfig::new().with_target_partitions(4);
+    config.options_mut().optimizer.repartition_asof_joins = true;
     let ctx = SessionContext::new_with_config(config);
     register_asof_test_tables(&ctx)?;
     let df = ctx
@@ -579,6 +580,63 @@ async fn asof_join_broadcasts_multi_partition_right_input() -> Result<()> {
             "| 5        | 8  | 60    |",
             "| 6        | 3  | 20    |",
             "+----------+----+-------+",
+        ],
+        &batches
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn asof_join_repartitions_by_equality_keys() -> Result<()> {
+    let mut config = SessionConfig::new().with_target_partitions(4);
+    config.options_mut().optimizer.repartition_asof_joins = true;
+    let ctx = SessionContext::new_with_config(config);
+    register_asof_test_tables(&ctx)?;
+
+    let df = ctx
+        .sql(
+            "SELECT t.trade_id, p.price FROM trades t ASOF JOIN prices p \
+             MATCH_CONDITION (t.ts >= p.ts) ON t.symbol = p.symbol",
+        )
+        .await?;
+    let plan = df.create_physical_plan().await?;
+    let asof = find_asof_exec(&plan).expect("physical ASOF join must be present");
+    let asof_exec = asof
+        .downcast_ref::<AsOfJoinExec>()
+        .expect("ASOF plan must downcast");
+    assert_eq!(asof_exec.partition_mode(), AsOfJoinMode::Partitioned);
+
+    let requirements = asof.input_distribution_requirements();
+    assert!(requirements.is_co_partitioned());
+    assert!(
+        requirements
+            .per_child_distributions()
+            .all(|distribution| matches!(distribution, Distribution::KeyPartitioned(_)))
+    );
+    for child in asof.children() {
+        assert!(matches!(
+            child.output_partitioning(),
+            Partitioning::Hash(_, 4)
+        ));
+    }
+    assert!(matches!(
+        asof.output_partitioning(),
+        Partitioning::Hash(_, 4)
+    ));
+
+    let batches = collect(plan, ctx.task_ctx()).await?;
+    assert_batches_sorted_eq!(
+        [
+            "+----------+-------+",
+            "| trade_id | price |",
+            "+----------+-------+",
+            "| 1        |       |",
+            "| 2        | 40    |",
+            "| 3        | 60    |",
+            "| 4        | 101   |",
+            "| 5        | 106   |",
+            "| 6        |       |",
+            "+----------+-------+",
         ],
         &batches
     );

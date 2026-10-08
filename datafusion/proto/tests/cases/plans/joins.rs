@@ -29,8 +29,8 @@ use datafusion::physical_plan::expressions::{
 };
 use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion::physical_plan::joins::{
-    AsOfJoinExec, AsOfMatchExpr, HashJoinExec, NestedLoopJoinExec, PartitionMode,
-    PiecewiseMergeJoinExec, SortMergeJoinExec, StreamJoinPartitionMode,
+    AsOfJoinExec, AsOfJoinMode, AsOfMatchExpr, HashJoinExec, NestedLoopJoinExec,
+    PartitionMode, PiecewiseMergeJoinExec, SortMergeJoinExec, StreamJoinPartitionMode,
     SymmetricHashJoinExec,
 };
 use datafusion::prelude::SessionContext;
@@ -109,17 +109,22 @@ fn roundtrip_asof_join() -> Result<()> {
 
     for projection in [None, Some(vec![]), Some(vec![0, 5])] {
         for op in [Operator::Lt, Operator::LtEq, Operator::Gt, Operator::GtEq] {
-            roundtrip_test(Arc::new(AsOfJoinExec::try_new(
-                Arc::new(EmptyExec::new(Arc::clone(&left_schema))),
-                Arc::new(EmptyExec::new(Arc::clone(&right_schema))),
-                on.clone(),
-                AsOfMatchExpr::new(
-                    Arc::new(Column::new("ts", 1)),
-                    op,
-                    Arc::new(Column::new("ts", 1)),
-                ),
-                projection.clone(),
-            )?))?;
+            for mode in [AsOfJoinMode::Broadcast, AsOfJoinMode::Partitioned] {
+                roundtrip_test(Arc::new(
+                    AsOfJoinExec::try_new(
+                        Arc::new(EmptyExec::new(Arc::clone(&left_schema))),
+                        Arc::new(EmptyExec::new(Arc::clone(&right_schema))),
+                        on.clone(),
+                        AsOfMatchExpr::new(
+                            Arc::new(Column::new("ts", 1)),
+                            op,
+                            Arc::new(Column::new("ts", 1)),
+                        ),
+                        projection.clone(),
+                    )?
+                    .with_partition_mode(mode)?,
+                ))?;
+            }
         }
     }
     Ok(())

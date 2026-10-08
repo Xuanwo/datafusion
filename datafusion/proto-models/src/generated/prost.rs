@@ -2734,6 +2734,9 @@ pub struct AsOfJoinExecNode {
     pub match_operator: i32,
     #[prost(uint32, repeated, tag = "7")]
     pub projection: ::prost::alloc::vec::Vec<u32>,
+    /// Co-partition both inputs by the equality keys instead of broadcasting the right input.
+    #[prost(bool, tag = "8")]
+    pub partitioned: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AsyncFuncExecNode {
